@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
-use tokio::net::{TcpListener, UnixListener, UnixStream};
+use tokio::net::{TcpListener, UnixStream};
 #[cfg(test)]
 use tokio_util::codec::Framed;
 use tracing::{debug, error, info, warn};
@@ -81,31 +81,6 @@ impl JsonRpcResponse {
     }
 }
 
-/// How often the server checks that its socket path still reaches it.
-const SOCKET_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
-
-/// Device and inode: what makes a socket file this listener's.
-fn file_id(meta: &std::fs::Metadata) -> (u64, u64) {
-    use std::os::unix::fs::MetadataExt;
-    (meta.dev(), meta.ino())
-}
-
-/// Bind `path` with permissions 0700 (PRD §13.1), returning the socket file's id.
-///
-/// The server rebinds when its socket file is unlinked -- by a tmp cleaner, or
-/// by a daemon from before the instance lock tidying up on its way out -- since
-/// clients would otherwise find nothing there while it still holds the lock.
-fn bind_uds(path: &std::path::Path) -> std::io::Result<(UnixListener, (u64, u64))> {
-    use std::os::unix::fs::PermissionsExt;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let listener = UnixListener::bind(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
-    let id = file_id(&std::fs::symlink_metadata(path)?);
-    Ok((listener, id))
-}
-
 impl Server {
     /// Create a new server with the given config and router.
     pub fn new(
@@ -124,14 +99,9 @@ impl Server {
     ///
     /// This runs until the CancellationToken is triggered.
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
-        // Clean up any stale socket file.
-        if self.config.socket_path.exists() {
-            std::fs::remove_file(&self.config.socket_path)?;
-        }
-
-        let (mut uds_listener, mut bound) = bind_uds(&self.config.socket_path)?;
+        let mut uds = crate::uds::OwnedSocket::bind(&self.config.socket_path)?;
         info!(path = %self.config.socket_path.display(), "UDS listener bound");
-        let mut socket_check = tokio::time::interval(SOCKET_CHECK_INTERVAL);
+        let mut socket_check = tokio::time::interval(crate::uds::CHECK_INTERVAL);
         socket_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         // Optionally bind TCP listener.
@@ -154,24 +124,9 @@ impl Server {
                     info!("server shutting down");
                     break;
                 }
-                _ = socket_check.tick() => {
-                    // Only a missing path is rebound: one bound since is someone else's.
-                    let path = &self.config.socket_path;
-                    if std::fs::symlink_metadata(path)
-                        .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
-                    {
-                        match bind_uds(path) {
-                            Ok((listener, id)) => {
-                                warn!(path = %path.display(), "socket was unlinked; rebound it");
-                                uds_listener = listener;
-                                bound = id;
-                            }
-                            Err(e) => warn!(error = %e, "socket was unlinked; rebind failed"),
-                        }
-                    }
-                }
+                _ = socket_check.tick() => uds.rebind_if_missing(),
                 // Accept UDS connections.
-                result = uds_listener.accept() => {
+                result = uds.listener().accept() => {
                     match result {
                         Ok((stream, _addr)) => {
                             debug!("accepted UDS connection");
@@ -217,10 +172,7 @@ impl Server {
             }
         }
 
-        // Only our own socket: the path may name a successor's by now.
-        if std::fs::symlink_metadata(&self.config.socket_path).is_ok_and(|m| file_id(&m) == bound) {
-            let _ = std::fs::remove_file(&self.config.socket_path);
-        }
+        drop(uds);
         info!("server stopped");
 
         Ok(())

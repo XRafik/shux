@@ -1252,3 +1252,49 @@ fn daemon_stop_finds_a_daemon_nothing_names() {
         String::from_utf8_lossy(&stopped.stdout)
     );
 }
+
+/// Daemons on two sockets in one runtime dir each keep their own attach socket:
+/// the second must not replace the first's, nor delete it when it stops.
+#[test]
+fn two_sockets_in_one_runtime_dir_do_not_share_an_attach_socket() {
+    use std::os::unix::fs::MetadataExt;
+    let runtime = tempfile::tempdir().expect("temp runtime");
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_shux"));
+    let dir = runtime.path().join("shux");
+    let other = runtime.path().join("other.sock");
+    let attach = dir.join("attach.sock");
+    let mut reaper = Reaper(Vec::new());
+
+    assert!(
+        run_bin(&bin, runtime.path(), None, &["session", "list"])
+            .status
+            .success()
+    );
+    reaper
+        .0
+        .push(wait_for_pid_file(&dir.join("shux.pid")) as i32);
+    let ino = std::fs::metadata(&attach).expect("attach socket").ino();
+
+    assert!(
+        run_bin(&bin, runtime.path(), Some(&other), &["session", "list"])
+            .status
+            .success()
+    );
+    for (_, pid) in wait_for_pid_files(&dir, 2) {
+        reaper.0.push(pid as i32);
+    }
+    assert_eq!(
+        std::fs::metadata(&attach).map(|m| m.ino()).ok(),
+        Some(ino),
+        "the second daemon took over the first's attach socket"
+    );
+    let stopped = run_bin(&bin, runtime.path(), Some(&other), &["daemon", "stop"]);
+    assert!(stopped.status.success(), "daemon stop failed");
+    assert!(
+        std::os::unix::net::UnixStream::connect(&attach).is_ok(),
+        "stopping the second daemon removed the first's attach socket"
+    );
+
+    let stopped = run_bin(&bin, runtime.path(), None, &["daemon", "stop"]);
+    assert!(stopped.status.success(), "daemon stop failed");
+}

@@ -189,11 +189,19 @@ pub fn socket_path() -> Result<PathBuf, DaemonError> {
     Ok(runtime_dir()?.join("shux.sock"))
 }
 
-/// Full path to the attach-session socket: `$RUNTIME_DIR/attach.sock`.
-/// Distinct from the JSON-RPC socket so the attach loop doesn't have to
-/// multiplex protocols on a single connection.
-pub fn attach_socket_path() -> Result<PathBuf, DaemonError> {
-    Ok(runtime_dir()?.join("attach.sock"))
+/// The attach-session socket of the daemon serving `socket`: `attach.sock` for
+/// the default socket, keyed like the pidfile otherwise, so daemons on other
+/// sockets in the same runtime dir do not take it over. Distinct from the
+/// JSON-RPC socket so the attach loop doesn't have to multiplex protocols on a
+/// single connection.
+pub fn attach_socket_path_for(socket: &Path) -> Result<PathBuf, DaemonError> {
+    let pidfile = pid_file_path_for(socket)?;
+    let key = pidfile
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(|stem| stem.strip_prefix("shux"))
+        .unwrap_or_default();
+    Ok(pidfile.with_file_name(format!("attach{key}.sock")))
 }
 
 /// Ensure the runtime directory exists with mode 0700.
@@ -755,6 +763,14 @@ mod tests {
         assert_eq!(
             instance_lock_path_for(other).unwrap(),
             dir.join("shux-36a9fb754e91bc3b.lock")
+        );
+        assert_eq!(
+            attach_socket_path_for(&default_sock).unwrap(),
+            dir.join("attach.sock")
+        );
+        assert_eq!(
+            attach_socket_path_for(other).unwrap(),
+            dir.join("attach-36a9fb754e91bc3b.sock")
         );
 
         unsafe { restore_xdg_runtime_dir(original) };

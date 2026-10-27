@@ -25,7 +25,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::UnixStream;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::codec::Framed;
 use tokio_util::sync::CancellationToken;
@@ -148,19 +148,9 @@ pub async fn run_attach_server(
     daemon_start: std::time::Instant,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
-    if socket_path.exists() {
-        let _ = std::fs::remove_file(&socket_path);
-    }
-    if let Some(parent) = socket_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let listener = UnixListener::bind(&socket_path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o700))?;
-    }
+    let mut socket = shux_rpc::uds::OwnedSocket::bind(&socket_path)?;
+    let mut socket_check = tokio::time::interval(shux_rpc::uds::CHECK_INTERVAL);
+    socket_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     info!(path = %socket_path.display(), "attach UDS listener bound");
 
     loop {
@@ -169,7 +159,8 @@ pub async fn run_attach_server(
                 info!("attach server shutting down");
                 break;
             }
-            res = listener.accept() => {
+            _ = socket_check.tick() => socket.rebind_if_missing(),
+            res = socket.listener().accept() => {
                 match res {
                     Ok((stream, _)) => {
                         let g = graph.clone();
@@ -195,7 +186,6 @@ pub async fn run_attach_server(
         }
     }
 
-    let _ = std::fs::remove_file(&socket_path);
     Ok(())
 }
 

@@ -470,7 +470,7 @@ pub(crate) async fn run_rpc_server(
 
     // Spawn the attach UDS listener (separate socket, dedicated streaming
     // protocol). The JSON-RPC socket below stays request-response.
-    let attach_path = daemon::attach_socket_path()?;
+    let attach_path = daemon::attach_socket_path_for(&socket_path)?;
     let attach_graph = graph_handle.clone();
     let attach_io = io_state.clone();
     let attach_cancel = cancel.clone();
