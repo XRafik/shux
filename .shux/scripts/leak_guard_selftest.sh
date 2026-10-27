@@ -353,15 +353,59 @@ stop_foreign_daemon
 # The stranded-child sweep is the most destructive code in the reaper, so it is exercised
 # for REAL — but only once the daemons this test made are gone and no other daemon of this
 # checkout is running, so a real reap cannot reach a concurrent session's work.
-if [ -z "$(shux_daemon_pids)" ]; then
+# Every descendant of a pid (mirrors reap_daemons.sh, which this must not trust).
+tree_pids() {
+  local pid
+  for pid in $(ps -axo pid=,ppid= | awk -v p="$1" '$2 == p { print $1 }'); do
+    printf '%s\n' "${pid}"
+    tree_pids "${pid}"
+  done
+}
+
+# One wedged daemon, reaped for real.
+#
+# The pane's shell backgrounds a `sleep` that ignores SIGHUP before it execs, so a
+# daemon's SIGKILL strands a grandchild that outlives the pane's own shell. With
+# `subreaper`, the daemon is started below a child subreaper, as under `systemd --user`
+# on a desktop: its orphans are adopted by that, not by init, and nothing reaps them.
+reap_wedged_daemon() {
+  local mode="$1" wedge_runtime wedge_pid wedge_tree bystander_needle bystander_pidfile
+  local bystander_pid wedge_reap_status bystander_alive pid holder="" ready
   wedge_runtime="$(mktemp -d "${TMPDIR:-/tmp}/shux-leak-guard-wedge.XXXXXX")"
   bystander_needle="leak-guard-bystander-$$"
-  env -u SHUX_SOCKET XDG_RUNTIME_DIR="${wedge_runtime}" "${shux_bin}" --format json \
-    session create leak-guard-wedge-$$ -d -- sh -lc 'sleep 400' >/dev/null
+  set -- env -u SHUX_SOCKET XDG_RUNTIME_DIR="${wedge_runtime}" "${shux_bin}" --format json \
+    session create leak-guard-wedge-$$ -d -- sh -c "trap '' HUP; sleep 401 & exec sleep 400"
+  if [ "${mode}" = subreaper ]; then
+    ready="${wedge_runtime}/subreaper-ready"
+    python3 -c '
+import ctypes, subprocess, sys, time
+assert ctypes.CDLL(None).prctl(36, 1, 0, 0, 0) == 0
+subprocess.run(sys.argv[2:], check=True, stdout=subprocess.DEVNULL)
+open(sys.argv[1], "w").close()
+time.sleep(600)
+' "${ready}" "$@" &
+    holder=$!
+    for _ in $(seq 100); do
+      [ -e "${ready}" ] && break
+      sleep 0.1
+    done
+  else
+    "$@" >/dev/null
+  fi
   wedge_pid="$(cat "${wedge_runtime}/shux/shux.pid")"
-  wedge_children="$(ps -axo pid=,ppid= | awk -v p="${wedge_pid}" '$2 == p { print $1 }')"
-  if [ -z "${wedge_children}" ]; then
-    echo "leak guard self-test: wedged daemon ${wedge_pid} had no pane child to strand" >&2
+  if [ -n "${holder}" ] && [ "$(ps -p "${wedge_pid}" -o ppid= | tr -d '[:space:]')" != "${holder}" ]; then
+    echo "leak guard self-test: daemon ${wedge_pid} is not below the subreaper ${holder}" >&2
+    kill -KILL "${wedge_pid}" "${holder}" >/dev/null 2>&1 || true
+    exit 1
+  fi
+  # The backgrounded sleep is forked after the session is created; wait for it.
+  for _ in $(seq 50); do
+    wedge_tree="$(tree_pids "${wedge_pid}")"
+    [ "$(printf '%s\n' "${wedge_tree}" | grep -c .)" -ge 2 ] && break
+    sleep 0.1
+  done
+  if [ "$(printf '%s\n' "${wedge_tree}" | grep -c .)" -lt 2 ]; then
+    echo "leak guard self-test: wedged daemon ${wedge_pid} had no pane tree to strand" >&2
     kill -KILL "${wedge_pid}" >/dev/null 2>&1 || true
     rm -rf "${wedge_runtime}"
     exit 1
@@ -390,22 +434,51 @@ if [ -z "$(shux_daemon_pids)" ]; then
   bystander_alive=1
   pid_is_gone "${bystander_pid}" && bystander_alive=0
   kill -KILL -- "-${bystander_pid}" >/dev/null 2>&1 || true
+  # Checked before the subreaper exits, which would hand its orphans to init.
+  local survivors=""
+  for pid in ${wedge_tree}; do
+    pid_is_gone "${pid}" || survivors="${survivors} ${pid}"
+  done
+  for pid in ${survivors}; do
+    echo "reap_daemons.sh left the wedged daemon's pane process running (${pid})" >&2
+    describe_pid "${pid}" >&2
+    kill -KILL "${pid}" >/dev/null 2>&1 || true
+  done
+  if [ -n "${holder}" ]; then
+    kill -TERM "${holder}" >/dev/null 2>&1 || true
+    wait "${holder}" 2>/dev/null || true
+  fi
   rm -rf "${wedge_runtime}"
+  [ -z "${survivors}" ] || exit 1
 
   if [ "${wedge_reap_status}" -ne 0 ]; then
     echo "reap_daemons.sh failed on a wedged daemon (status ${wedge_reap_status})" >&2
     exit 1
   fi
-  for pid in ${wedge_children}; do
-    pid_is_gone "${pid}" && continue
-    echo "reap_daemons.sh left the wedged daemon's pane child running (${pid})" >&2
-    describe_pid "${pid}" >&2
-    kill -KILL "${pid}" >/dev/null 2>&1 || true
-    exit 1
-  done
   if [ "${bystander_alive}" -ne 1 ]; then
     echo "reap_daemons.sh killed a process it did not strand (${bystander_pid})" >&2
     exit 1
+  fi
+}
+
+# Runs `$@` as a child subreaper, as `systemd --user` is on a desktop: orphans below it
+# are adopted by it rather than by init, and it never reaps or signals them.
+subreaper() {
+  python3 -c '
+import ctypes, subprocess, sys, threading
+assert ctypes.CDLL(None).prctl(36, 1, 0, 0, 0) == 0
+sys.exit(subprocess.run(sys.argv[1:]).returncode)
+' "$@"
+}
+
+# The stranded-child sweep is the most destructive code in the reaper, so it is exercised
+# for REAL — but only once the daemons this test made are gone and no other daemon of this
+# checkout is running, so a real reap cannot reach a concurrent session's work.
+if [ -z "$(shux_daemon_pids)" ]; then
+  reap_wedged_daemon plain
+  # PR_SET_CHILD_SUBREAPER is Linux-only.
+  if [ "$(uname -s)" = "Linux" ]; then
+    reap_wedged_daemon subreaper
   fi
 else
   echo "note: other daemons from this checkout are running; skipping the reap sweep case" >&2

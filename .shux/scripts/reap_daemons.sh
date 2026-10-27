@@ -28,9 +28,25 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 # shellcheck disable=SC2207  # mapfile is bash 4+; macOS ships bash 3.2
 pids=($(shux_daemon_pids))
 
-# Children of a pid, listed while it is still their parent.
-child_pids() {
-  ps -axo pid=,ppid= | awk -v parent="$1" '$2 == parent { print $1 }'
+# Every descendant of a pid, listed while it is still the root of their tree. A pane's
+# shell forks too, and what it forks can ignore the SIGHUP that ends the shell.
+descendant_pids() {
+  ps -axo pid=,ppid= | awk -v root="$1" '
+    { parent[NR] = $2; pid[NR] = $1 }
+    END {
+      tree[root] = 1
+      do {
+        grew = 0
+        for (i = 1; i <= NR; i++) {
+          if ((parent[i] in tree) && !(pid[i] in tree)) { tree[pid[i]] = 1; print pid[i]; grew = 1 }
+        }
+      } while (grew)
+    }'
+}
+
+# When a pid started, which with the pid names one process: pids are reused.
+start_time() {
+  ps -p "$1" -o lstart= 2>/dev/null | tr -s ' ' || true
 }
 
 if [ "${#pids[@]}" -eq 0 ]; then
@@ -43,12 +59,12 @@ for pid in "${pids[@]}"; do
 done
 
 # Recorded before anything is signalled: SIGKILL destroys the only evidence of who owned
-# these. Once the daemon is gone its panes read as PPID 1, with nothing connecting them
-# to it. See the sweep below.
-daemon_children=()
+# these. Once the daemon is gone its panes are orphans, adopted by init or by whatever
+# subreaper is nearest, with nothing connecting them to it. See the sweep below.
+descendants=()
 for pid in "${pids[@]}"; do
-  for child in $(child_pids "${pid}"); do
-    daemon_children+=("${child}")
+  for child in $(descendant_pids "${pid}"); do
+    descendants+=("${child}=$(start_time "${child}")")
   done
 done
 
@@ -84,18 +100,16 @@ fi
 # anything else in this checkout that orphans a process during the reap window looks
 # identical, and since shux auto-starts a daemon on first use, a concurrent command mints
 # one that passes every test a timing sweep applies — measured, an earlier version of
-# this killed exactly that. Each pid below was a child of a daemon we stopped, and is an
-# orphan now because we stopped it.
+# this killed exactly that. Each pid below descended from a daemon we stopped, and still
+# has the start time it had then, so it is that process and not one reusing its pid. Its
+# parent now says nothing: init, a subreaper, or a zombie daemon not yet torn down.
 stranded=()
 set +u
-for pid in "${daemon_children[@]:-}"; do
-  [ -n "${pid}" ] || continue
+for entry in "${descendants[@]:-}"; do
+  [ -n "${entry}" ] || continue
+  pid="${entry%%=*}"
   pid_is_gone "${pid}" && continue
-  # Init, or still the daemon: a multi-threaded daemon reads as a zombie once its leader
-  # thread exits, and its children keep naming it as parent until the rest of its threads
-  # have torn down — which can be after `terminate_pids` has called it gone.
-  ppid="$(ps -p "${pid}" -o ppid= 2>/dev/null | tr -d '[:space:]')"
-  [ "${ppid}" = "1" ] || pid_in_list "${ppid}" "${pids[@]}" || continue
+  [ "$(start_time "${pid}")" = "${entry#*=}" ] || continue
   stranded+=("${pid}")
 done
 set -u
