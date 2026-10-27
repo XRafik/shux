@@ -908,7 +908,7 @@ fn a_client_does_not_take_the_socket_of_a_server_it_cannot_stop() {
         "a client replaced a server it could not stop"
     );
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("no pidfile names"),
+        String::from_utf8_lossy(&out.stderr).contains("no shux daemon process serves it"),
         "the error must say why: {}",
         String::from_utf8_lossy(&out.stderr)
     );
@@ -919,4 +919,336 @@ fn a_client_does_not_take_the_socket_of_a_server_it_cannot_stop() {
         "the server's socket was unlinked"
     );
     drop(server);
+}
+
+/// `daemon stop` must not unlink files once its daemon has exited: a client that
+/// arrived during the stop may already have started the successor they belong to.
+#[test]
+fn daemon_stop_leaves_the_successors_files_alone() {
+    let h = ShuxHarness::new();
+    let socket = h.runtime_dir().join("shux").join("shux.sock");
+    let mut reaper = Reaper(Vec::new());
+
+    assert!(
+        h.shux()
+            .args(["session", "create", "k", "-d", "--", "sh", "-c", "sleep 60"])
+            .output()
+            .expect("run shux")
+            .status
+            .success()
+    );
+    let old = h.daemon_pid().expect("daemon pidfile");
+    reaper.0.push(old as i32);
+
+    let stop = h
+        .shux()
+        .args(["daemon", "stop"])
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn daemon stop");
+    thread::sleep(Duration::from_millis(50));
+    let during = h
+        .shux()
+        .args(["session", "list"])
+        .output()
+        .expect("run shux");
+    assert!(during.status.success(), "a client during the stop failed");
+    stop.wait_with_output().expect("wait for daemon stop");
+    assert_pid_gone(old, "the stopped daemon");
+
+    assert_eq!(settle_daemon_count(&socket, 1, &mut reaper), 1);
+    assert!(socket.exists(), "the successor's socket was unlinked");
+    let started = Instant::now();
+    let after = h
+        .shux()
+        .args(["session", "list"])
+        .output()
+        .expect("run shux");
+    assert!(
+        after.status.success() && started.elapsed() < Duration::from_secs(2),
+        "the successor stopped answering ({:?}): {}",
+        started.elapsed(),
+        String::from_utf8_lossy(&after.stderr)
+    );
+}
+
+/// Every spelling of one socket path names one daemon: concurrent clients
+/// spelling it differently must still start one, and any spelling stops it.
+#[test]
+fn spellings_of_one_socket_share_one_daemon() {
+    let runtime = tempfile::tempdir().expect("temp runtime");
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_shux"));
+    let dir = runtime.path().join("s");
+    std::fs::create_dir(&dir).expect("mkdir socket dir");
+    let socket = dir.join("a.sock");
+    let spellings = [
+        socket.clone(),
+        PathBuf::from(format!("{}//a.sock", dir.display())),
+        dir.join("..").join("s").join("a.sock"),
+    ];
+    let mut reaper = Reaper(Vec::new());
+
+    let clients: Vec<_> = (0..12)
+        .map(|i| {
+            Command::new(&bin)
+                .args(["session", "list"])
+                .env("XDG_RUNTIME_DIR", runtime.path())
+                .env("SHUX_SOCKET", &spellings[i % spellings.len()])
+                .env("NO_COLOR", "1")
+                .env("SHELL", "/bin/sh")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn shux")
+        })
+        .collect();
+    for client in clients {
+        let out = client.wait_with_output().expect("wait for shux");
+        assert!(
+            out.status.success(),
+            "a client failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // Count by the directory, whichever spelling a daemon was started with.
+    let needle = runtime.path().display().to_string();
+    let count = |reaper: &mut Reaper| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let out = Command::new("ps")
+                .args(["-ww", "-Ao", "pid=,command="])
+                .output()
+                .expect("run ps");
+            let pids: Vec<i32> = String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter(|l| l.contains(" __daemon --socket ") && l.contains(&needle))
+                .filter_map(|l| l.split_whitespace().next()?.parse().ok())
+                .collect();
+            for pid in &pids {
+                if !reaper.0.contains(pid) {
+                    reaper.0.push(*pid);
+                }
+            }
+            if pids.len() <= 1 || Instant::now() >= deadline {
+                return pids.len();
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    };
+    assert_eq!(
+        count(&mut reaper),
+        1,
+        "spellings of one socket started several daemons"
+    );
+
+    let stopped = run_bin(
+        &bin,
+        runtime.path(),
+        Some(&spellings[2]),
+        &["daemon", "stop"],
+    );
+    assert!(
+        String::from_utf8_lossy(&stopped.stdout).contains("daemon stopped"),
+        "a different spelling could not stop the daemon: {}",
+        String::from_utf8_lossy(&stopped.stdout)
+    );
+}
+
+/// A daemon whose socket file was unlinked -- by a tmp cleaner, or by a daemon
+/// from before the instance lock tidying up as it exits -- serves it again.
+/// Otherwise it holds the instance lock, so no replacement can start either.
+#[test]
+fn a_daemon_whose_socket_was_unlinked_serves_it_again() {
+    let h = ShuxHarness::new();
+    let socket = h.runtime_dir().join("shux").join("shux.sock");
+    let pidfile = h.runtime_dir().join("shux").join("shux.pid");
+    let mut reaper = Reaper(Vec::new());
+
+    assert!(
+        h.shux()
+            .args([
+                "session", "create", "kept", "-d", "--", "sh", "-c", "sleep 60"
+            ])
+            .output()
+            .expect("run shux")
+            .status
+            .success()
+    );
+    let pid = h.daemon_pid().expect("daemon pidfile");
+    reaper.0.push(pid as i32);
+    std::fs::remove_file(&socket).expect("unlink the socket");
+    std::fs::remove_file(&pidfile).expect("unlink the pidfile");
+
+    let started = Instant::now();
+    let out = h
+        .shux()
+        .args(["session", "list"])
+        .output()
+        .expect("run shux");
+    assert!(
+        out.status.success() && started.elapsed() < Duration::from_secs(3),
+        "the daemon did not serve its socket again ({:?}): {}",
+        started.elapsed(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("kept"),
+        "a new daemon answered instead of the one holding the session"
+    );
+    assert_eq!(daemons_serving(&socket), vec![pid as i32]);
+
+    let stopped = h
+        .shux()
+        .args(["daemon", "stop"])
+        .output()
+        .expect("run shux");
+    assert!(stopped.status.success(), "daemon stop failed");
+    assert_pid_gone(pid, "the daemon");
+}
+
+/// A daemon that accepts connections and never answers -- stopped, or wedged --
+/// is reported rather than waited on for ever.
+#[test]
+fn a_client_reports_a_daemon_that_does_not_answer() {
+    let h = ShuxHarness::new();
+    assert!(
+        h.shux()
+            .args(["session", "list"])
+            .output()
+            .expect("run shux")
+            .status
+            .success()
+    );
+    let pid = h.daemon_pid().expect("daemon pidfile");
+    struct Resume(i32);
+    impl Drop for Resume {
+        fn drop(&mut self) {
+            let _ = kill(Pid::from_raw(self.0), Signal::SIGCONT);
+        }
+    }
+    let _resume = Resume(pid as i32);
+    kill(Pid::from_raw(pid as i32), Signal::SIGSTOP).expect("SIGSTOP daemon");
+
+    let mut client = h
+        .shux()
+        .args(["session", "list"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn shux");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while client.try_wait().expect("poll client").is_none() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+    let hung = client.try_wait().expect("poll client").is_none();
+    if hung {
+        let _ = client.kill();
+    }
+    let out = client.wait_with_output().expect("wait for shux");
+    assert!(!hung, "a client hung on a daemon that does not answer");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success()
+            && stderr.contains("did not answer")
+            && stderr.contains(&pid.to_string()),
+        "the error must name the daemon: {stderr}"
+    );
+}
+
+/// `daemon stop` judges exit by identity: a daemon that exited under a
+/// subreaper that never reaps it stays a zombie, which `kill(pid, 0)` still
+/// reports alive.
+#[cfg(target_os = "linux")]
+#[test]
+fn daemon_stop_sees_a_daemon_exit_under_a_subreaper() {
+    const SUBREAPER: &str = "import ctypes, subprocess, sys, time\n\
+        assert ctypes.CDLL(None).prctl(36, 1, 0, 0, 0) == 0\n\
+        subprocess.run(sys.argv[1:], check=True)\n\
+        print('ready', flush=True)\n\
+        time.sleep(120)\n";
+    let h = ShuxHarness::new();
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_shux"));
+    let mut subreaper = Command::new("python3")
+        .args(["-c", SUBREAPER])
+        .arg(&bin)
+        .args(["session", "list"])
+        .env("XDG_RUNTIME_DIR", h.runtime_dir())
+        .env("NO_COLOR", "1")
+        .env("SHELL", "/bin/sh")
+        .env_remove("SHUX_SOCKET")
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("python3 runs the subreaper");
+    struct KillOnDrop(std::process::Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let stdout = subreaper.stdout.take().expect("subreaper stdout");
+    let _subreaper = KillOnDrop(subreaper);
+    let mut ready = String::new();
+    std::io::BufRead::read_line(&mut std::io::BufReader::new(stdout), &mut ready)
+        .expect("read subreaper");
+    assert_eq!(
+        ready.trim(),
+        "ready",
+        "the client under the subreaper failed"
+    );
+    let pid = h.daemon_pid().expect("daemon pidfile");
+
+    let stopped = h
+        .shux()
+        .args(["daemon", "stop"])
+        .output()
+        .expect("run shux");
+    assert!(
+        stopped.status.success()
+            && String::from_utf8_lossy(&stopped.stdout).contains("daemon stopped"),
+        "daemon stop misjudged the exited daemon: {}{}",
+        String::from_utf8_lossy(&stopped.stdout),
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    // Precondition, or the test proves nothing: the daemon is a zombie, not gone.
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+    assert!(
+        stat.contains(") Z "),
+        "the daemon was reaped after all: {stat:?}"
+    );
+}
+
+/// A daemon that neither a pidfile nor the instance lock names -- one from
+/// before the lock, whose pidfile was lost -- is still found by its argv.
+#[test]
+fn daemon_stop_finds_a_daemon_nothing_names() {
+    let runtime = tempfile::tempdir().expect("temp runtime");
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_shux"));
+    let dir = runtime.path().join("shux");
+    let mut reaper = Reaper(Vec::new());
+
+    assert!(
+        run_bin(&bin, runtime.path(), None, &["session", "list"])
+            .status
+            .success()
+    );
+    let pid = wait_for_pid_file(&dir.join("shux.pid"));
+    reaper.0.push(pid as i32);
+    std::fs::remove_file(dir.join("shux.pid")).expect("lose the pidfile");
+    std::fs::write(dir.join("shux.lock"), "").expect("blank the lock's pid");
+
+    let status = run_bin(&bin, runtime.path(), None, &["daemon", "status"]);
+    assert!(
+        String::from_utf8_lossy(&status.stdout).contains(&format!("pid {pid}")),
+        "daemon status missed the daemon: {}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+    let stopped = run_bin(&bin, runtime.path(), None, &["daemon", "stop"]);
+    assert!(stopped.status.success(), "daemon stop failed");
+    assert!(
+        wait_for_pid_gone(pid, Duration::from_secs(5)),
+        "daemon stop left a daemon nothing names: {}",
+        String::from_utf8_lossy(&stopped.stdout)
+    );
 }

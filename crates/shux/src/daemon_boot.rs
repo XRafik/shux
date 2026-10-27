@@ -34,7 +34,7 @@ pub fn run_daemon(socket_override: Option<PathBuf>) -> anyhow::Result<()> {
     };
 
     // Step 1: Daemonize BEFORE tokio. The instance lock is held until this
-    // function returns, which is after the socket and pidfile are removed.
+    // function returns, which is after its socket and pidfile are removed.
     let Some(_instance_lock) = daemon::daemonize(&sock_path)? else {
         return Ok(());
     };
@@ -108,9 +108,8 @@ pub fn run_daemon(socket_override: Option<PathBuf>) -> anyhow::Result<()> {
         tokens.root.cancel();
         shutdown_all_pane_io(io_state).await;
 
-        // Cleanup
-        daemon::remove_pid_file_for(&sock_path)?;
-        daemon::remove_socket_file_for(&sock_path)?;
+        // The RPC server has already removed its own socket.
+        daemon::remove_own_pid_file_for(&sock_path)?;
         tracing::info!("Daemon shut down cleanly");
 
         Ok::<(), anyhow::Error>(())
@@ -184,15 +183,9 @@ fn served_socket(argv: &[String]) -> Option<PathBuf> {
     None
 }
 
-/// Whether two socket paths name the same endpoint.
+/// Whether two socket paths name the same endpoint, socket file present or not.
 fn same_socket(a: &Path, b: &Path) -> bool {
-    if a == b {
-        return true;
-    }
-    match (a.canonicalize(), b.canonicalize()) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => false,
-    }
+    a == b || daemon::socket_key(a) == daemon::socket_key(b)
 }
 
 /// True when `pid` is alive AND is a shux daemon serving `socket`.
@@ -205,14 +198,52 @@ pub(crate) fn is_live_shux_daemon(pid: u32, socket: &Path) -> bool {
     if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_err() {
         return false;
     }
-    match process_argv(pid) {
-        Some(ProcessArgv::Exact(argv)) => argv_is_daemon_for(&argv, socket),
-        Some(ProcessArgv::Joined(joined)) => {
-            joined.contains(" __daemon") && joined_serves_socket(&joined, socket)
+    // Without a way to confirm identity, refuse to claim it is ours.
+    process_argv(pid).is_some_and(|argv| argv.serves(socket))
+}
+
+impl ProcessArgv {
+    fn serves(&self, socket: &Path) -> bool {
+        match self {
+            ProcessArgv::Exact(argv) => argv_is_daemon_for(argv, socket),
+            ProcessArgv::Joined(joined) => {
+                joined.contains(" __daemon") && joined_serves_socket(joined, socket)
+            }
         }
-        // Without a way to confirm identity, refuse to claim it is ours.
-        None => false,
     }
+}
+
+/// Every process with a readable argv, for finding a daemon nothing names.
+#[cfg(target_os = "linux")]
+fn all_processes() -> Vec<(u32, ProcessArgv)> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<u32>().ok())
+        .filter_map(|pid| Some((pid, process_argv(pid)?)))
+        .collect()
+}
+
+/// One `ps` for the whole table: a `ps` per pid would cost a fork each.
+#[cfg(not(target_os = "linux"))]
+fn all_processes() -> Vec<(u32, ProcessArgv)> {
+    let Ok(out) = std::process::Command::new("ps")
+        .args(["-ww", "-Ao", "pid=,args="])
+        .output()
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| {
+            let (pid, args) = line.trim_start().split_once(' ')?;
+            Some((
+                pid.parse().ok()?,
+                ProcessArgv::Joined(args.trim_end().to_string()),
+            ))
+        })
+        .collect()
 }
 
 /// Whether `argv` is a shux daemon serving `socket`. Split out so it can be
@@ -226,40 +257,33 @@ fn argv_is_daemon_for(argv: &[String], socket: &Path) -> bool {
     served_socket(argv).is_some_and(|served| same_socket(&served, socket))
 }
 
-/// Our live daemon for `socket`, and the pidfile that named it.
+/// The pid of our live daemon for `socket`.
 ///
-/// The pidfile path travels with the pid because they must not be looked up
-/// separately: the file removed after a successful stop has to be the file the
-/// pid came from, which on an upgrade is the legacy one.
-pub(crate) struct LiveDaemon {
-    pub(crate) pid: u32,
-    pub(crate) pidfile: PathBuf,
-}
-
-/// The only sanctioned way to turn a pidfile into a pid you may signal.
-///
-/// Both signalling paths go through here so the check cannot be forgotten:
-/// `daemon stop`, and the version-mismatch restart in `client::kill_stale_daemon`
-/// -- which had none and SIGTERMed whatever the pidfile held. pid 0 and 1 are
-/// rejected: `kill(0, ..)` signals the process group and pid 1 is init.
-///
-/// The instance lock records its holder's pid too, so a daemon whose pidfile
-/// was lost is still found. The lock file itself is never reported as the
-/// pidfile: callers delete that, and the lock must not be unlinked.
-pub(crate) fn our_live_daemon(socket: &Path) -> Option<LiveDaemon> {
+/// The only sanctioned way to turn a pidfile into a pid you may signal: `daemon
+/// stop` and the stale-daemon restart in `client` both come through here, so
+/// the identity check cannot be forgotten. pid 0 and 1 are rejected: `kill(0,
+/// ..)` signals the process group and pid 1 is init. The instance lock records
+/// its holder's pid too, so a daemon whose pidfile was lost is still found.
+pub(crate) fn our_live_daemon(socket: &Path) -> Option<u32> {
     let live = |path: &Path| {
         daemon::read_pid_at(path).filter(|&pid| pid > 1 && is_live_shux_daemon(pid, socket))
     };
-    for pidfile in daemon::pid_file_candidates(socket).ok()? {
-        if let Some(pid) = live(&pidfile) {
-            return Some(LiveDaemon { pid, pidfile });
-        }
-    }
-    let pid = live(&daemon::instance_lock_path_for(socket).ok()?)?;
-    Some(LiveDaemon {
-        pid,
-        pidfile: daemon::pid_file_path_for(socket).ok()?,
-    })
+    let named = daemon::pid_file_candidates(socket)
+        .ok()?
+        .iter()
+        .find_map(|pidfile| live(pidfile));
+    // A daemon from before the instance lock whose pidfile was lost is named by
+    // nothing at all, so its own argv is the last place left to look.
+    named
+        .or_else(|| live(&daemon::instance_lock_path_for(socket).ok()?))
+        .or_else(|| {
+            all_processes()
+                .into_iter()
+                .find(|(pid, argv)| {
+                    *pid > 1 && argv.serves(socket) && is_live_shux_daemon(*pid, socket)
+                })
+                .map(|(pid, _)| pid)
+        })
 }
 
 /// `shux daemon stop|status` — the missing half of the daemon lifecycle (085 F5).
@@ -276,13 +300,11 @@ pub(crate) fn handle_daemon_command(
     format: cli::OutputFormat,
     socket: &Path,
 ) -> anyhow::Result<()> {
-    // Carries the validated pid AND the file it came from, so the pid signalled
-    // is the pid that was validated and the file removed is the one that named it.
     let ours = our_live_daemon(socket);
 
     match command {
         cli::DaemonCommand::Status => {
-            match ours.as_ref().map(|d| d.pid) {
+            match ours {
                 Some(p) => match format {
                     cli::OutputFormat::Json => println!("{{\"running\": true, \"pid\": {p}}}"),
                     _ => println!(
@@ -299,7 +321,7 @@ pub(crate) fn handle_daemon_command(
             Ok(())
         }
         cli::DaemonCommand::Stop => {
-            let Some(LiveDaemon { pid: p, pidfile }) = ours else {
+            let Some(p) = ours else {
                 // Idempotent, and exit 0: a cleanup trap may run this twice
                 // (skills/shux/references/gate.md).
                 if let cli::OutputFormat::Json = format {
@@ -307,7 +329,6 @@ pub(crate) fn handle_daemon_command(
                 } else {
                     println!("{}", style::muted("no daemon running"));
                 }
-                let _ = daemon::remove_pid_file_for(socket);
                 return Ok(());
             };
             // SIGTERM → the daemon's signal handler runs a graceful shutdown.
@@ -315,18 +336,20 @@ pub(crate) fn handle_daemon_command(
                 nix::unistd::Pid::from_raw(p as i32),
                 nix::sys::signal::Signal::SIGTERM,
             );
+            // Identity, not `kill(pid, 0)`: an exited daemon stays a zombie until
+            // its parent reaps it, which a subreaper may never do. The budget
+            // outlasts the daemon's 3s pane drain.
             let mut gone = false;
-            for _ in 0..40 {
-                if nix::sys::signal::kill(nix::unistd::Pid::from_raw(p as i32), None).is_err() {
+            for _ in 0..100 {
+                if !is_live_shux_daemon(p, socket) {
                     gone = true;
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
-            if gone {
-                let _ = std::fs::remove_file(&pidfile);
-                let _ = daemon::remove_socket_file_for(socket);
-            }
+            // Nothing is unlinked here: the daemon removes its own socket and
+            // pidfile on the way out, and by now a client may have started its
+            // successor, whose files these would be.
             match (format, gone) {
                 (cli::OutputFormat::Json, _) => {
                     println!("{{\"stopped\": {gone}, \"pid\": {p}}}")
@@ -336,12 +359,10 @@ pub(crate) fn handle_daemon_command(
                     style::success("daemon stopped"),
                     style::muted(format!("pid {p}"))
                 ),
-                (_, false) => println!(
-                    "{}",
-                    style::warning(format!(
-                        "daemon (pid {p}) did not exit within 2s; it may be draining a session"
-                    ))
-                ),
+                (_, false) => {}
+            }
+            if !gone {
+                anyhow::bail!("daemon (pid {p}) did not exit within 5s");
             }
             Ok(())
         }
