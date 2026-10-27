@@ -260,6 +260,8 @@ pub struct VtHandler<'a> {
     /// Whether retired buffers may be recycled. Always `true` in production;
     /// the differential tests drive a second terminal with it off.
     pub(crate) reuse_retired_grids: bool,
+    /// OSC 7501 state; framing lives in `program_status`, RIS lives here.
+    pub(crate) program_status: &'a mut Option<crate::program_status::VtProgramStatus>,
 }
 
 impl<'a> VtHandler<'a> {
@@ -1777,6 +1779,9 @@ impl<'a> vte::Perform for VtHandler<'a> {
                 // character, so a REP straight after one repeats nothing
                 // (issue #122).
                 *self.last_graphic = None;
+                if let Some(ps) = self.program_status.as_mut() {
+                    ps.on_full_reset();
+                }
                 // When the image/placement store lands, RIS must clear it here:
                 // the graphics protocol requires that "when resetting the
                 // terminal, all images that are visible on the screen must be
@@ -1805,6 +1810,10 @@ impl<'a> vte::Perform for VtHandler<'a> {
         }
         let terminator = osc_terminator(bell_terminated);
         match params[0] {
+            // Program status and prompt marks are framed from raw bytes by
+            // `program_status::OscStatusScanner`; vte cannot tell ST from an
+            // aborted string.
+            b"7501" | b"133" => {}
             // OSC 0 -- Set Icon Name and Window Title.
             // OSC 2 -- Set Window Title.
             b"0" | b"2" => {
@@ -2378,7 +2387,8 @@ fn parse_osc_color(bytes: &[u8]) -> Result<[u8; 3], ()> {
 }
 
 fn parse_hex_color(hex: &str) -> Result<[u8; 3], ()> {
-    if hex.len() != 6 {
+    // All ASCII hex digits before slicing: six *bytes* may be fewer chars.
+    if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(());
     }
     let r = u8::from_str_radix(&hex[0..2], 16).map_err(|_| ())?;
@@ -2409,6 +2419,27 @@ fn parse_rgb_component(component: &str) -> Result<u8, ()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A `#rrggbb` colour whose six bytes hold a multi-byte character must be
+    /// rejected, not sliced mid-character: the slice panicked, and the pane
+    /// then stopped rendering (found by fuzzing `vt_program_status_stream`).
+    #[test]
+    fn hex_colours_with_multibyte_characters_are_rejected_not_sliced() {
+        for seq in [
+            "\x1b]11;#a\u{e9}\u{e9}b\x07",
+            "\x1b]10;#a\u{e9}\u{e9}b\x1b\\",
+            "\x1b]12;#\u{e9}\u{e9}\u{e9}\x07",
+            "\x1b]4;1;#a\u{e9}\u{e9}b\x07",
+        ] {
+            let mut vt = crate::VirtualTerminal::new(2, 20);
+            vt.process(seq.as_bytes());
+            vt.process(b"after");
+            assert!(
+                vt.capture_text(None).contains("after"),
+                "{seq:?} stopped the terminal"
+            );
+        }
+    }
 
     /// Tracking 1005/1015/1016 must not make DECRQM claim them: `0` ("not
     /// recognized") stays true because shux never emits these encodings, and an
@@ -2523,6 +2554,7 @@ mod tests {
                 palette_overridden: &mut palette_overridden,
                 alt_spare: &mut self.alt_spare,
                 reuse_retired_grids: true,
+                program_status: &mut None,
             };
             self.parser.advance(&mut handler, bytes);
         }

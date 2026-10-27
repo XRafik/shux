@@ -301,6 +301,23 @@ pub enum GraphCommand {
         title: String,
         reply: tokio::sync::oneshot::Sender<Result<(), GraphError>>,
     },
+    SetPaneProgramStatus {
+        id: PaneId,
+        status: PaneStatusUpdate,
+        reply: tokio::sync::oneshot::Sender<Result<(), GraphError>>,
+    },
+    ClaimPanePty {
+        id: PaneId,
+        incarnation: u64,
+        reply: tokio::sync::oneshot::Sender<Result<bool, GraphError>>,
+    },
+    SetPaneExitStatusOwned {
+        id: PaneId,
+        exit_status: i32,
+        incarnation: u64,
+        final_status: Option<PaneStatusUpdate>,
+        reply: tokio::sync::oneshot::Sender<Result<(), GraphError>>,
+    },
     SplitPane {
         target_pane: PaneId,
         direction: Direction,
@@ -351,9 +368,32 @@ pub enum GraphCommand {
     },
 }
 
+/// One program-status publication for a pane, as its terminal produced it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneStatusUpdate {
+    /// Process-global and monotonic; see `set_pane_program_status`.
+    pub generation: u64,
+    pub enabled: bool,
+    pub summary: Option<shux_program_status::StatusSummary>,
+    pub seen: bool,
+}
+
+/// A poisoned side map only means a panic mid-insert; the map is still valid.
+fn side_map(
+    map: &std::sync::Mutex<HashMap<PaneId, u64>>,
+) -> std::sync::MutexGuard<'_, HashMap<PaneId, u64>> {
+    map.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// The authoritative session graph (single-writer owner of state).
 pub struct SessionGraph {
     state: Arc<ArcSwap<SessionGraphSnapshot>>,
+    /// Last accepted program-status generation per pane. Kept outside the
+    /// snapshot so recording one costs no snapshot clone.
+    status_generations: std::sync::Mutex<HashMap<PaneId, u64>>,
+    /// The PTY incarnation that currently owns each pane. An exit reported
+    /// by any other incarnation is stale: that task was replaced.
+    pty_owners: std::sync::Mutex<HashMap<PaneId, u64>>,
     /// Optional event bus. When set, every successful mutation publishes a
     /// typed event to subscribers. Held as `Option` so legacy unit tests can
     /// continue to call `SessionGraph::new()` without setting up a bus.
@@ -376,6 +416,8 @@ impl SessionGraph {
         let state = Arc::new(ArcSwap::from(snapshot));
         let graph = Self {
             state: Arc::clone(&state),
+            status_generations: Default::default(),
+            pty_owners: Default::default(),
             event_bus,
         };
         (graph, state)
@@ -567,6 +609,10 @@ impl SessionGraph {
     /// `SessionGraph` mutations now also publish typed events to the bus, and having
     /// two unrelated `publish` methods on the same type is a recipe for confusion.
     fn commit_snapshot(&self, snapshot: SessionGraphSnapshot) {
+        // Per-pane side maps never outlive the pane.
+        for map in [&self.pty_owners, &self.status_generations] {
+            side_map(map).retain(|pid, _| snapshot.panes.contains_key(pid));
+        }
         self.state.store(Arc::new(snapshot));
     }
 
@@ -1312,6 +1358,66 @@ impl SessionGraph {
         Ok(())
     }
 
+    /// PTY incarnation `incarnation` now runs this pane, unless a newer one
+    /// already claimed it (`Ok(false)`, nothing changes). A pane already
+    /// marked exited by a task this one replaced is running again: its exit
+    /// is cleared and `PaneRespawned` fires.
+    pub fn claim_pane_pty(&self, id: PaneId, incarnation: u64) -> Result<bool, GraphError> {
+        let current = self.current();
+        let pane = current.panes.get(&id).ok_or(GraphError::PaneNotFound(id))?;
+        {
+            let mut owners = side_map(&self.pty_owners);
+            if owners.get(&id).is_some_and(|&owner| owner > incarnation) {
+                return Ok(false);
+            }
+            owners.insert(id, incarnation);
+        }
+        if pane.exit_status.is_none() {
+            return Ok(true);
+        }
+        let window_id = pane.window_id;
+        let session_id = current
+            .windows
+            .get(&window_id)
+            .map(|w| w.session_id)
+            .ok_or(GraphError::WindowNotFound(window_id))?;
+        let command = pane.command.clone();
+        let mut snapshot = (*current).clone();
+        snapshot.version += 1;
+        if let Some(p) = snapshot.panes.get_mut(&id) {
+            p.exit_status = None;
+            p.version += 1;
+        }
+        self.commit_snapshot(snapshot);
+        self.fire(EventData::PaneRespawned {
+            pane_id: id,
+            window_id,
+            session_id,
+            command,
+        });
+        Ok(true)
+    }
+
+    /// A PTY task's exit, applied only if `incarnation` still owns the pane.
+    /// `final_status` (the terminal's status as the process left it) commits
+    /// first under the same check, so `pane.status_changed` precedes
+    /// `pane.exited` and a successor's state is never touched.
+    pub fn set_pane_exit_status_owned(
+        &self,
+        id: PaneId,
+        exit_status: i32,
+        incarnation: u64,
+        final_status: Option<PaneStatusUpdate>,
+    ) -> Result<(), GraphError> {
+        if side_map(&self.pty_owners).get(&id) != Some(&incarnation) {
+            return Ok(());
+        }
+        if let Some(status) = final_status {
+            self.set_pane_program_status(id, status)?;
+        }
+        self.set_pane_exit_status(id, exit_status)
+    }
+
     pub fn set_pane_exit_status(&self, id: PaneId, exit_status: i32) -> Result<(), GraphError> {
         let current = self.current();
 
@@ -1532,6 +1638,70 @@ impl SessionGraph {
                 new_title,
             });
         }
+        Ok(())
+    }
+
+    /// Record a pane's OSC 7501 status as published by its terminal.
+    ///
+    /// Publications carry a process-global generation; one at or below the
+    /// last accepted for this pane is stale and ignored, so a summary read
+    /// before a disable or a terminal replacement can never come back. The
+    /// watermark advances only once the pane is known to be routable, and
+    /// before the equality check: an equal publication suppresses the event,
+    /// never the watermark. Fires `PaneStatusChanged` when the summary,
+    /// `seen` or `enabled` changes.
+    pub fn set_pane_program_status(
+        &self,
+        id: PaneId,
+        status: PaneStatusUpdate,
+    ) -> Result<(), GraphError> {
+        let current = self.current();
+        let pane = current.panes.get(&id).ok_or(GraphError::PaneNotFound(id))?;
+        // Sealed: an exit commits the final status first; nothing follows
+        // `pane.exited` until a respawn claim clears `exit_status`.
+        if pane.exit_status.is_some() {
+            return Ok(());
+        }
+        let window_id = pane.window_id;
+        let session_id = current
+            .windows
+            .get(&window_id)
+            .map(|w| w.session_id)
+            .ok_or(GraphError::WindowNotFound(window_id))?;
+        {
+            let mut gens = side_map(&self.status_generations);
+            let last = gens.entry(id).or_insert(0);
+            if status.generation <= *last {
+                return Ok(());
+            }
+            *last = status.generation;
+        }
+        if pane.program_status == status.summary
+            && pane.program_status_seen == status.seen
+            && pane.program_status_enabled == status.enabled
+        {
+            return Ok(());
+        }
+        let old = pane.program_status.clone().map(Box::new);
+
+        let mut snapshot = (*current).clone();
+        snapshot.version += 1;
+        if let Some(p) = snapshot.panes.get_mut(&id) {
+            p.program_status = status.summary.clone();
+            p.program_status_seen = status.seen;
+            p.program_status_enabled = status.enabled;
+            p.version += 1;
+        }
+        self.commit_snapshot(snapshot);
+        self.fire(EventData::PaneStatusChanged {
+            pane_id: id,
+            window_id,
+            session_id,
+            old,
+            new: status.summary.map(Box::new),
+            seen: status.seen,
+            enabled: status.enabled,
+        });
         Ok(())
     }
 
@@ -2216,6 +2386,15 @@ pub async fn run_graph_loop(
                     Some(GraphCommand::SetPaneOscTitle { id, title, reply }) => {
                         let _ = reply.send(graph.set_pane_osc_title(id, title));
                     }
+                    Some(GraphCommand::SetPaneProgramStatus { id, status, reply }) => {
+                        let _ = reply.send(graph.set_pane_program_status(id, status));
+                    }
+                    Some(GraphCommand::ClaimPanePty { id, incarnation, reply }) => {
+                        let _ = reply.send(graph.claim_pane_pty(id, incarnation));
+                    }
+                    Some(GraphCommand::SetPaneExitStatusOwned { id, exit_status, incarnation, final_status, reply }) => {
+                        let _ = reply.send(graph.set_pane_exit_status_owned(id, exit_status, incarnation, final_status));
+                    }
                     Some(GraphCommand::SplitPane { target_pane, direction, ratio, command, reply }) => {
                         let _ = reply.send(graph.split_pane_with_command(target_pane, direction, ratio, command));
                     }
@@ -2610,6 +2789,57 @@ impl GraphHandle {
             .send(GraphCommand::SetPaneOscTitle {
                 id,
                 title,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| GraphError::Shutdown)?;
+        rx.await.map_err(|_| GraphError::Shutdown)?
+    }
+
+    pub async fn claim_pane_pty(&self, id: PaneId, incarnation: u64) -> Result<bool, GraphError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(GraphCommand::ClaimPanePty {
+                id,
+                incarnation,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| GraphError::Shutdown)?;
+        rx.await.map_err(|_| GraphError::Shutdown)?
+    }
+
+    pub async fn set_pane_exit_status_owned(
+        &self,
+        id: PaneId,
+        exit_status: i32,
+        incarnation: u64,
+        final_status: Option<PaneStatusUpdate>,
+    ) -> Result<(), GraphError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(GraphCommand::SetPaneExitStatusOwned {
+                id,
+                exit_status,
+                incarnation,
+                final_status,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| GraphError::Shutdown)?;
+        rx.await.map_err(|_| GraphError::Shutdown)?
+    }
+
+    pub async fn set_pane_program_status(
+        &self,
+        id: PaneId,
+        status: PaneStatusUpdate,
+    ) -> Result<(), GraphError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(GraphCommand::SetPaneProgramStatus {
+                id,
+                status,
                 reply: tx,
             })
             .await
@@ -4297,6 +4527,366 @@ mod tests {
         }
         // Pane still in the graph since destroy was rejected.
         assert!(state.load().panes.contains_key(&pid));
+    }
+
+    fn status(state: shux_program_status::State) -> shux_program_status::StatusSummary {
+        shux_program_status::StatusSummary {
+            state,
+            kind: None,
+            progress: None,
+            app: Some("claude-code".into()),
+            id: None,
+            counts: Default::default(),
+        }
+    }
+
+    fn upd(
+        generation: u64,
+        summary: Option<shux_program_status::StatusSummary>,
+        seen: bool,
+    ) -> PaneStatusUpdate {
+        PaneStatusUpdate {
+            generation,
+            enabled: true,
+            summary,
+            seen,
+        }
+    }
+
+    #[test]
+    fn an_exit_reported_by_a_replaced_pty_incarnation_is_ignored() {
+        let bus = crate::bus::EventBus::new();
+        let (graph, state) = SessionGraph::new_with_event_bus(Some(bus.clone()));
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let pid = state.load().windows[&state.load().sessions[&sid].windows[0]].active_pane;
+        graph.claim_pane_pty(pid, 1).unwrap();
+        graph.claim_pane_pty(pid, 2).unwrap();
+        graph.set_pane_exit_status_owned(pid, -1, 1, None).unwrap();
+        assert_eq!(
+            state.load().panes[&pid].exit_status,
+            None,
+            "stale exit applied"
+        );
+        graph.set_pane_exit_status_owned(pid, 0, 2, None).unwrap();
+        assert_eq!(state.load().panes[&pid].exit_status, Some(0));
+    }
+
+    #[test]
+    fn claiming_an_exited_pane_brings_it_back() {
+        let bus = crate::bus::EventBus::new();
+        let (graph, state) = SessionGraph::new_with_event_bus(Some(bus.clone()));
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let pid = state.load().windows[&state.load().sessions[&sid].windows[0]].active_pane;
+        graph.claim_pane_pty(pid, 1).unwrap();
+        // The old task's exit committed before the new task's claim.
+        graph.set_pane_exit_status_owned(pid, -1, 1, None).unwrap();
+        graph.claim_pane_pty(pid, 2).unwrap();
+        assert_eq!(state.load().panes[&pid].exit_status, None);
+        let respawned = bus
+            .history(50)
+            .into_iter()
+            .any(|e| matches!(e.data, EventData::PaneRespawned { pane_id, .. } if pane_id == pid));
+        assert!(
+            respawned,
+            "consumers that saw pane.exited must learn it runs again"
+        );
+    }
+
+    #[test]
+    fn a_claim_older_than_the_owner_changes_nothing() {
+        let bus = crate::bus::EventBus::new();
+        let (graph, state) = SessionGraph::new_with_event_bus(Some(bus.clone()));
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let pid = state.load().windows[&state.load().sessions[&sid].windows[0]].active_pane;
+        let _ = graph.claim_pane_pty(pid, 2);
+        let _ = graph.claim_pane_pty(pid, 1);
+        let _ = graph.set_pane_exit_status_owned(pid, 0, 2, None);
+        assert_eq!(
+            state.load().panes[&pid].exit_status,
+            Some(0),
+            "the live owner's exit was dropped"
+        );
+        let _ = graph.claim_pane_pty(pid, 1);
+        assert_eq!(
+            state.load().panes[&pid].exit_status,
+            Some(0),
+            "an older claim revived an exited pane"
+        );
+        let respawned = bus
+            .history(50)
+            .into_iter()
+            .any(|e| matches!(e.data, EventData::PaneRespawned { .. }));
+        assert!(!respawned, "PaneRespawned fired for a dead pane");
+    }
+
+    #[test]
+    fn an_exit_from_an_unclaimed_pane_is_ignored() {
+        let (graph, state) = SessionGraph::new_with_event_bus(None);
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let pid = state.load().windows[&state.load().sessions[&sid].windows[0]].active_pane;
+        graph.set_pane_exit_status_owned(pid, 9, 99, None).unwrap();
+        assert_eq!(state.load().panes[&pid].exit_status, None);
+    }
+
+    #[test]
+    fn an_exited_pane_takes_no_further_status() {
+        use shux_program_status::State;
+        let bus = crate::bus::EventBus::new();
+        let (graph, state) = SessionGraph::new_with_event_bus(Some(bus.clone()));
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let pid = state.load().windows[&state.load().sessions[&sid].windows[0]].active_pane;
+        graph.claim_pane_pty(pid, 1).unwrap();
+        graph
+            .set_pane_exit_status_owned(pid, 0, 1, Some(upd(5, Some(status(State::Done)), true)))
+            .unwrap();
+        // A publication racing the exit (e.g. a config reload) lands after it.
+        graph
+            .set_pane_program_status(pid, upd(9, None, true))
+            .unwrap();
+        assert_eq!(
+            state.load().panes[&pid]
+                .program_status
+                .as_ref()
+                .map(|s| s.state),
+            Some(State::Done),
+            "a status after pane.exited replaced the final one"
+        );
+        let last = bus
+            .history(50)
+            .into_iter()
+            .rev()
+            .find_map(|e| match e.data {
+                EventData::PaneStatusChanged { pane_id, .. } if pane_id == pid => Some("status"),
+                EventData::PaneExited { pane_id, .. } if pane_id == pid => Some("exited"),
+                _ => None,
+            });
+        assert_eq!(last, Some("exited"));
+        // A respawn reopens it.
+        graph.claim_pane_pty(pid, 2).unwrap();
+        graph
+            .set_pane_program_status(pid, upd(10, None, true))
+            .unwrap();
+        assert_eq!(state.load().panes[&pid].program_status, None);
+    }
+
+    #[test]
+    fn an_owned_exit_commits_its_final_status_first() {
+        use shux_program_status::State;
+        let bus = crate::bus::EventBus::new();
+        let (graph, state) = SessionGraph::new_with_event_bus(Some(bus.clone()));
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let pid = state.load().windows[&state.load().sessions[&sid].windows[0]].active_pane;
+        graph.claim_pane_pty(pid, 1).unwrap();
+        graph.claim_pane_pty(pid, 2).unwrap();
+
+        graph
+            .set_pane_exit_status_owned(pid, 3, 1, Some(upd(5, Some(status(State::Error)), true)))
+            .unwrap();
+        assert_eq!(
+            state.load().panes[&pid].program_status,
+            None,
+            "stale status applied"
+        );
+        assert_eq!(state.load().panes[&pid].exit_status, None);
+
+        graph
+            .set_pane_exit_status_owned(pid, 0, 2, Some(upd(6, Some(status(State::Done)), true)))
+            .unwrap();
+        let pane = &state.load().panes[&pid];
+        assert_eq!(
+            pane.program_status.as_ref().map(|s| s.state),
+            Some(State::Done)
+        );
+        assert_eq!(pane.exit_status, Some(0));
+        let order: Vec<&str> = bus
+            .history(50)
+            .iter()
+            .filter_map(|e| match e.data {
+                EventData::PaneStatusChanged { pane_id, .. } if pane_id == pid => Some("status"),
+                EventData::PaneExited { pane_id, .. } if pane_id == pid => Some("exited"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(order, ["status", "exited"]);
+    }
+
+    #[test]
+    fn destroying_a_pane_forgets_its_owner_and_generation() {
+        let (graph, state) = SessionGraph::new_with_event_bus(None);
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let wid = state.load().sessions[&sid].windows[0];
+        let first = state.load().windows[&wid].active_pane;
+        let second = graph.split_pane(first, Direction::Horizontal, 0.5).unwrap();
+        for pid in [first, second] {
+            let _ = graph.claim_pane_pty(pid, 1);
+            graph
+                .set_pane_program_status(pid, upd(1, None, true))
+                .unwrap();
+        }
+        graph.destroy_pane(second, None).unwrap();
+        let owners = graph.pty_owners.lock().unwrap().clone();
+        let gens = graph.status_generations.lock().unwrap().clone();
+        assert!(!owners.contains_key(&second), "owner kept: {owners:?}");
+        assert!(!gens.contains_key(&second), "generation kept: {gens:?}");
+        assert!(owners.contains_key(&first) && gens.contains_key(&first));
+    }
+
+    #[test]
+    fn disabling_an_empty_pane_is_an_observable_change() {
+        let bus = crate::bus::EventBus::new();
+        let (graph, state) = SessionGraph::new_with_event_bus(Some(bus.clone()));
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let pid = state.load().windows[&state.load().sessions[&sid].windows[0]].active_pane;
+        graph
+            .set_pane_program_status(pid, upd(1, None, false))
+            .unwrap();
+        let off = PaneStatusUpdate {
+            generation: 2,
+            enabled: false,
+            summary: None,
+            seen: false,
+        };
+        graph.set_pane_program_status(pid, off).unwrap();
+        assert!(!state.load().panes[&pid].program_status_enabled);
+        let last = status_events(&bus).pop().unwrap();
+        assert!(
+            matches!(last, EventData::PaneStatusChanged { enabled: false, .. }),
+            "a waiter must be able to see the disable: {last:?}"
+        );
+    }
+
+    fn status_events(bus: &crate::bus::EventBus) -> Vec<EventData> {
+        bus.history(100)
+            .into_iter()
+            .map(|e| e.data)
+            .filter(|d| matches!(d, EventData::PaneStatusChanged { .. }))
+            .collect()
+    }
+
+    #[test]
+    fn program_status_records_the_summary_and_fires_on_change_only() {
+        use shux_program_status::State;
+        let bus = crate::bus::EventBus::new();
+        let (graph, state) = SessionGraph::new_with_event_bus(Some(bus.clone()));
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let pid = state.load().windows[&state.load().sessions[&sid].windows[0]].active_pane;
+
+        graph
+            .set_pane_program_status(pid, upd(10, Some(status(State::Working)), true))
+            .unwrap();
+        assert_eq!(
+            state.load().panes[&pid].program_status,
+            Some(status(State::Working))
+        );
+        assert!(state.load().panes[&pid].program_status_seen);
+        // A newer generation with the same summary (a msg-only change) is
+        // accepted silently.
+        let version = state.load().version;
+        graph
+            .set_pane_program_status(pid, upd(11, Some(status(State::Working)), true))
+            .unwrap();
+        assert_eq!(
+            state.load().version,
+            version,
+            "no commit for an equal summary"
+        );
+        graph
+            .set_pane_program_status(pid, upd(12, Some(status(State::Done)), true))
+            .unwrap();
+
+        let events = status_events(&bus);
+        assert_eq!(events.len(), 2);
+        match &events[1] {
+            EventData::PaneStatusChanged { old, new, seen, .. } => {
+                assert_eq!(old.as_deref(), Some(&status(State::Working)));
+                assert_eq!(new.as_deref(), Some(&status(State::Done)));
+                assert!(*seen);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn program_status_ignores_stale_generations() {
+        use shux_program_status::State;
+        let (graph, state) = SessionGraph::new();
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let pid = state.load().windows[&state.load().sessions[&sid].windows[0]].active_pane;
+
+        graph
+            .set_pane_program_status(pid, upd(20, None, false))
+            .unwrap();
+        // A summary read before the disable at generation 20 arrives late.
+        graph
+            .set_pane_program_status(pid, upd(19, Some(status(State::Blocked)), true))
+            .unwrap();
+        assert_eq!(
+            state.load().panes[&pid].program_status,
+            None,
+            "stale must not resurrect"
+        );
+        graph
+            .set_pane_program_status(pid, upd(20, Some(status(State::Blocked)), true))
+            .unwrap();
+        assert_eq!(
+            state.load().panes[&pid].program_status,
+            None,
+            "equal generation is stale too"
+        );
+        graph
+            .set_pane_program_status(pid, upd(21, Some(status(State::Blocked)), true))
+            .unwrap();
+        assert_eq!(
+            state.load().panes[&pid].program_status,
+            Some(status(State::Blocked))
+        );
+    }
+
+    #[test]
+    fn an_equal_publication_still_moves_the_watermark() {
+        use shux_program_status::State;
+        let (graph, state) = SessionGraph::new();
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let pid = state.load().windows[&state.load().sessions[&sid].windows[0]].active_pane;
+        graph
+            .set_pane_program_status(pid, upd(10, Some(status(State::Working)), true))
+            .unwrap();
+        graph
+            .set_pane_program_status(pid, upd(15, Some(status(State::Working)), true))
+            .unwrap();
+        // Read before generation 15 was taken; arrives after it.
+        graph
+            .set_pane_program_status(pid, upd(12, Some(status(State::Blocked)), true))
+            .unwrap();
+        assert_eq!(
+            state.load().panes[&pid].program_status,
+            Some(status(State::Working))
+        );
+    }
+
+    #[test]
+    fn program_status_for_a_missing_pane_is_not_found() {
+        let (graph, _state) = SessionGraph::new();
+        let err = graph
+            .set_pane_program_status(PaneId::new(), upd(1, None, false))
+            .unwrap_err();
+        assert!(matches!(err, GraphError::PaneNotFound(_)));
+    }
+
+    #[test]
+    fn program_status_is_never_serialized_with_the_pane() {
+        use shux_program_status::State;
+        let (graph, state) = SessionGraph::new();
+        let sid = graph.create_session("work".into(), home()).unwrap();
+        let pid = state.load().windows[&state.load().sessions[&sid].windows[0]].active_pane;
+        graph
+            .set_pane_program_status(pid, upd(1, Some(status(State::Blocked)), true))
+            .unwrap();
+        let json = serde_json::to_string(&**state.load()).unwrap();
+        assert!(
+            !json.contains("program_status") && !json.contains("claude-code"),
+            "{json}"
+        );
     }
 
     #[test]

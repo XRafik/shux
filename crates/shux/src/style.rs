@@ -1670,6 +1670,179 @@ pub fn print_pane_wait_settled(pane_id: &str, settled: bool, revision: u64, wait
     }
 }
 
+/// Colour a program-status state the way it reads: blocked and error need you.
+fn status_state(state: &str) -> String {
+    match state {
+        "blocked" | "error" => error(state).to_string(),
+        "working" => accent(state).to_string(),
+        "done" => success(state).to_string(),
+        _ => muted(state).to_string(),
+    }
+}
+
+/// Program-authored text, made safe to print on a terminal.
+fn status_text(v: &serde_json::Value, key: &str) -> Option<String> {
+    v.get(key)
+        .and_then(|t| t.as_str())
+        .map(shux_program_status::display::sanitize_for_display)
+}
+
+/// Print `pane status`: the summary line, then one line per record.
+pub fn print_pane_status(result: &serde_json::Value) {
+    let pane_id = result.get("pane_id").and_then(|v| v.as_str()).unwrap_or("");
+    if result.get("enabled") == Some(&serde_json::Value::Bool(false)) {
+        println!(
+            "{} pane {} program status is off ([program_status] enabled = false)",
+            muted("·"),
+            muted(&short_id(pane_id)),
+        );
+        return;
+    }
+    let records = result
+        .get("records")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let Some(summary) = result.get("summary").filter(|s| !s.is_null()) else {
+        let seen = result.get("seen") == Some(&serde_json::Value::Bool(true));
+        let why = if seen {
+            "nothing active"
+        } else {
+            "no program has reported"
+        };
+        println!("{} pane {} {}", muted("·"), muted(&short_id(pane_id)), why);
+        return;
+    };
+    let state = summary.get("state").and_then(|v| v.as_str()).unwrap_or("?");
+    let mut line = format!(
+        "{} pane {} {}",
+        bold("●"),
+        muted(&short_id(pane_id)),
+        status_state(state)
+    );
+    if let Some(kind) = summary.get("kind").and_then(|v| v.as_str()) {
+        line.push_str(&format!(" ({kind})"));
+    }
+    if let Some(app) = status_text(summary, "app") {
+        line.push_str(&format!("  {}", accent(app)));
+    }
+    if let Some(progress) = summary.get("progress").and_then(|v| v.as_u64()) {
+        line.push_str(&format!("  {progress}%"));
+    }
+    println!("{line}");
+    for record in &records {
+        let state = record.get("state").and_then(|v| v.as_str()).unwrap_or("?");
+        let mut line = format!("  {} {}", muted("·"), status_state(state));
+        if let Some(kind) = record.get("kind").and_then(|v| v.as_str()) {
+            line.push_str(&format!(" ({kind})"));
+        }
+        if let Some(app) = status_text(record, "app") {
+            line.push_str(&format!("  {}", muted(app)));
+        }
+        if let Some(progress) = record.get("progress").and_then(|v| v.as_u64()) {
+            line.push_str(&format!("  {progress}%"));
+        }
+        if let Some(title) = status_text(record, "title") {
+            line.push_str(&format!("  {}", bold(title)));
+        }
+        if let Some(msg) = status_text(record, "msg") {
+            line.push_str(&format!(" — {msg}"));
+        }
+        println!("{line}");
+    }
+}
+
+/// `pane status --format plain`: tab-separated, no colour. One `summary` line,
+/// then one `record` line per record:
+/// `record\tSTATE\tKIND\tAPP\tPROGRESS\tID\tTITLE\tMSG` (empty when absent).
+pub fn print_pane_status_plain(result: &serde_json::Value) {
+    let field = |v: &serde_json::Value, key: &str| -> String {
+        match v.get(key) {
+            Some(serde_json::Value::String(s)) => {
+                shux_program_status::display::sanitize_for_display(s).replace('\t', " ")
+            }
+            Some(serde_json::Value::Number(n)) => n.to_string(),
+            _ => String::new(),
+        }
+    };
+    let enabled = result.get("enabled") != Some(&serde_json::Value::Bool(false));
+    let summary = result.get("summary").filter(|s| !s.is_null());
+    println!(
+        "summary\t{}\t{}\t{}",
+        field(result, "pane_id"),
+        if enabled { "on" } else { "off" },
+        summary.map(|s| field(s, "state")).unwrap_or_default(),
+    );
+    for record in result
+        .get("records")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+    {
+        println!(
+            "record\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            field(record, "state"),
+            field(record, "kind"),
+            field(record, "app"),
+            field(record, "progress"),
+            field(record, "id"),
+            field(record, "title"),
+            field(record, "msg"),
+        );
+    }
+}
+
+/// `pane wait-status --format plain`: `OUTCOME\tPANE_ID\tSTATE`.
+pub fn print_pane_wait_status_plain(result: &serde_json::Value) {
+    let s = |p: &str| result.pointer(p).and_then(|v| v.as_str()).unwrap_or("");
+    println!(
+        "{}\t{}\t{}",
+        s("/outcome"),
+        s("/pane_id"),
+        s("/summary/state")
+    );
+}
+
+/// Print `pane wait-status`'s outcome.
+pub fn print_pane_wait_status(result: &serde_json::Value, states: &[String]) {
+    let pane_id = short_id(result.get("pane_id").and_then(|v| v.as_str()).unwrap_or(""));
+    match result.get("outcome").and_then(|v| v.as_str()).unwrap_or("") {
+        "matched" => {
+            let state = result
+                .pointer("/summary/state")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            println!(
+                "{} pane {} is {}",
+                success("✓"),
+                muted(pane_id),
+                status_state(state)
+            );
+        }
+        "timeout" => println!(
+            "{} pane {} did not reach {} in time",
+            warning("✗"),
+            muted(pane_id),
+            states.join("|"),
+        ),
+        "disabled" => println!(
+            "{} pane {} has program status off ([program_status] enabled = false)",
+            warning("✗"),
+            muted(pane_id),
+        ),
+        other => println!(
+            "{} pane {} {}",
+            warning("✗"),
+            muted(pane_id),
+            if other == "pane_gone" {
+                "exited before reaching the state"
+            } else {
+                other
+            },
+        ),
+    }
+}
+
 /// Print a `pane checkpoint` summary (lens PRD §7/§10): the keyed revision
 /// and, when a 5th checkpoint evicted the FIFO-oldest, the evicted revision.
 pub fn print_pane_checkpoint(pane_id: &str, revision: u64, evicted: Option<u64>) {

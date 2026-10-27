@@ -377,10 +377,15 @@ pub(crate) fn register_pane_io_methods(
                         .cancel_command(command_id)
                         .ok_or_else(|| shux_rpc::RpcError::not_found("command", cmd_id_str))?;
 
-                    // Send Ctrl-C to the pane
+                    // Ctrl-C, without waiting: a pane whose input is backed
+                    // up must not hold this lock.
                     let pane_id = shux_core::model::PaneId::from_uuid(pane_uuid);
-                    if let Some(writer) = state.writers.get(&pane_id) {
-                        let _ = writer.send(vec![0x03]).await; // ETX = Ctrl-C
+                    let writer = state.writers.get(&pane_id).cloned();
+                    drop(state);
+                    if let Some(writer) = writer
+                        && writer.try_send(vec![0x03]).is_err()
+                    {
+                        tracing::warn!(%pane_id, "pane input is backed up; Ctrl-C not delivered");
                     }
 
                     Ok(serde_json::json!({
@@ -1959,7 +1964,7 @@ mod tests {
             payload.len() > 64 * 1024,
             "payload should exceed sampled pane.output pending cap"
         );
-        tee_pane_recorders(&harness.io, pane_id, &payload, &harness.cancel).await;
+        tee_pane_recorders(&harness.io, pane_id, None, &payload, &harness.cancel).await;
 
         let stopped = dispatch_ok(
             &harness.router,
@@ -2039,9 +2044,23 @@ mod tests {
         )
         .await;
         let recording_id = started["recording_id"].as_str().unwrap().to_string();
-        tee_pane_recorders(&harness.io, pane_id, b"before-deadline", &harness.cancel).await;
+        tee_pane_recorders(
+            &harness.io,
+            pane_id,
+            None,
+            b"before-deadline",
+            &harness.cancel,
+        )
+        .await;
         tokio::time::sleep(std::time::Duration::from_millis(75)).await;
-        tee_pane_recorders(&harness.io, pane_id, b"after-deadline", &harness.cancel).await;
+        tee_pane_recorders(
+            &harness.io,
+            pane_id,
+            None,
+            b"after-deadline",
+            &harness.cancel,
+        )
+        .await;
 
         let stopped = dispatch_ok(
             &harness.router,
