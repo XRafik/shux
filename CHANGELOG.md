@@ -1,3 +1,10 @@
+# [0.52.0](https://github.com/indrasvat/shux/compare/v0.51.0...v0.52.0) (2026-10-27)
+
+
+### Features
+
+* OSC 7501 program status — pane status RPCs, CLI and events ([#195](https://github.com/indrasvat/shux/issues/195)) ([b020688](https://github.com/indrasvat/shux/commit/b020688e4fd044820fe6bd582d800299cdec6468))
+
 # [0.51.0](https://github.com/indrasvat/shux/compare/v0.50.0...v0.51.0) (2026-09-02)
 
 
