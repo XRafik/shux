@@ -428,7 +428,7 @@ fn wait_for_pid_files(dir: &Path, n: usize) -> Vec<(PathBuf, u32)> {
     }
 }
 
-fn run_bin(bin: &Path, runtime: &Path, socket: Option<&Path>, args: &[&str]) -> Output {
+fn bin_cmd(bin: &Path, runtime: &Path, socket: Option<&Path>, args: &[&str]) -> Command {
     let mut cmd = Command::new(bin);
     cmd.args(args)
         .env("XDG_RUNTIME_DIR", runtime)
@@ -438,7 +438,13 @@ fn run_bin(bin: &Path, runtime: &Path, socket: Option<&Path>, args: &[&str]) -> 
         Some(s) => cmd.env("SHUX_SOCKET", s),
         None => cmd.env_remove("SHUX_SOCKET"),
     };
-    cmd.output().expect("run shux")
+    cmd
+}
+
+fn run_bin(bin: &Path, runtime: &Path, socket: Option<&Path>, args: &[&str]) -> Output {
+    bin_cmd(bin, runtime, socket, args)
+        .output()
+        .expect("run shux")
 }
 
 /// One build must stop a daemon another build started.
@@ -641,14 +647,20 @@ fn the_legacy_pidfile_is_not_claimed_by_a_daemon_serving_another_socket() {
 /// `socket` lives in a per-test tempdir, so the needle is unique to this run;
 /// `ps` is a machine-wide view and a shared needle would count other suites.
 fn daemons_serving(socket: &Path) -> Vec<i32> {
-    let needle = format!("__daemon --socket {}", socket.display());
+    let canonical = socket
+        .parent()
+        .and_then(|dir| dir.canonicalize().ok())
+        .zip(socket.file_name())
+        .map_or_else(|| socket.to_path_buf(), |(dir, name)| dir.join(name));
+    let needles =
+        [socket, canonical.as_path()].map(|s| format!("__daemon --socket {}", s.display()));
     let out = Command::new("ps")
         .args(["-ww", "-Ao", "pid=,command="])
         .output()
         .expect("run ps");
     String::from_utf8_lossy(&out.stdout)
         .lines()
-        .filter(|line| line.trim_end().ends_with(&needle))
+        .filter(|line| needles.iter().any(|n| line.trim_end().ends_with(n)))
         .filter_map(|line| line.split_whitespace().next()?.parse().ok())
         .collect()
 }
@@ -681,12 +693,7 @@ fn concurrent_first_use_clients_start_exactly_one_daemon() {
 
     let clients: Vec<_> = (0..8)
         .map(|_| {
-            Command::new(&bin)
-                .args(["session", "list"])
-                .env("XDG_RUNTIME_DIR", runtime.path())
-                .env("NO_COLOR", "1")
-                .env("SHELL", "/bin/sh")
-                .env_remove("SHUX_SOCKET")
+            bin_cmd(&bin, runtime.path(), None, &["session", "list"])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::piped())
                 .spawn()
@@ -891,8 +898,8 @@ fn a_client_does_not_take_the_socket_of_a_server_it_cannot_stop() {
     let socket = dir.join("shux.sock");
     let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind fake server");
     // Accepts and hangs up: the client cannot read a version, so it is stale,
-    // and no pidfile names it.
-    let server = thread::spawn(move || {
+    // and no pidfile names it. Detached: it dies with the test process.
+    thread::spawn(move || {
         for conn in listener.incoming() {
             match conn {
                 Ok(conn) => drop(conn),
@@ -918,7 +925,6 @@ fn a_client_does_not_take_the_socket_of_a_server_it_cannot_stop() {
         std::os::unix::net::UnixStream::connect(&socket).is_ok(),
         "the server's socket was unlinked"
     );
-    drop(server);
 }
 
 /// `daemon stop` must not unlink files once its daemon has exited: a client that
@@ -990,16 +996,16 @@ fn spellings_of_one_socket_share_one_daemon() {
 
     let clients: Vec<_> = (0..12)
         .map(|i| {
-            Command::new(&bin)
-                .args(["session", "list"])
-                .env("XDG_RUNTIME_DIR", runtime.path())
-                .env("SHUX_SOCKET", &spellings[i % spellings.len()])
-                .env("NO_COLOR", "1")
-                .env("SHELL", "/bin/sh")
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
-                .expect("spawn shux")
+            bin_cmd(
+                &bin,
+                runtime.path(),
+                Some(&spellings[i % spellings.len()]),
+                &["session", "list"],
+            )
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn shux")
         })
         .collect();
     for client in clients {
@@ -1011,33 +1017,8 @@ fn spellings_of_one_socket_share_one_daemon() {
         );
     }
 
-    // Count by the directory, whichever spelling a daemon was started with.
-    let needle = runtime.path().display().to_string();
-    let count = |reaper: &mut Reaper| {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let out = Command::new("ps")
-                .args(["-ww", "-Ao", "pid=,command="])
-                .output()
-                .expect("run ps");
-            let pids: Vec<i32> = String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .filter(|l| l.contains(" __daemon --socket ") && l.contains(&needle))
-                .filter_map(|l| l.split_whitespace().next()?.parse().ok())
-                .collect();
-            for pid in &pids {
-                if !reaper.0.contains(pid) {
-                    reaper.0.push(*pid);
-                }
-            }
-            if pids.len() <= 1 || Instant::now() >= deadline {
-                return pids.len();
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-    };
     assert_eq!(
-        count(&mut reaper),
+        settle_daemon_count(&socket, 1, &mut reaper),
         1,
         "spellings of one socket started several daemons"
     );
@@ -1052,6 +1033,54 @@ fn spellings_of_one_socket_share_one_daemon() {
         String::from_utf8_lossy(&stopped.stdout).contains("daemon stopped"),
         "a different spelling could not stop the daemon: {}",
         String::from_utf8_lossy(&stopped.stdout)
+    );
+}
+
+/// A daemon started from a relative `SHUX_SOCKET` is found by its absolute
+/// path from another cwd: a relative spelling in its argv would resolve
+/// against the checker's cwd, not the one it was started from.
+#[test]
+fn a_daemon_started_from_a_relative_socket_is_stopped_by_its_absolute_path() {
+    let runtime = tempfile::tempdir().expect("temp runtime");
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_shux"));
+    let dir = runtime.path().join("d");
+    std::fs::create_dir(&dir).expect("mkdir socket dir");
+    let mut reaper = Reaper(Vec::new());
+
+    let started = bin_cmd(
+        &bin,
+        runtime.path(),
+        Some(Path::new("rel.sock")),
+        &["session", "list"],
+    )
+    .current_dir(&dir)
+    .output()
+    .expect("run shux");
+    assert!(
+        started.status.success(),
+        "a relative socket did not start a daemon: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let (_, pid) = wait_for_pid_files(&runtime.path().join("shux"), 1)
+        .into_iter()
+        .next()
+        .expect("one pidfile");
+    reaper.0.push(pid as i32);
+
+    let stopped = bin_cmd(
+        &bin,
+        runtime.path(),
+        Some(&dir.join("rel.sock")),
+        &["daemon", "stop"],
+    )
+    .current_dir(runtime.path())
+    .output()
+    .expect("run shux");
+    assert!(
+        wait_for_pid_gone(pid, Duration::from_secs(5)),
+        "the absolute path did not stop the daemon: {}{}",
+        String::from_utf8_lossy(&stopped.stdout),
+        String::from_utf8_lossy(&stopped.stderr)
     );
 }
 

@@ -206,8 +206,11 @@ impl ProcessArgv {
     fn serves(&self, socket: &Path) -> bool {
         match self {
             ProcessArgv::Exact(argv) => argv_is_daemon_for(argv, socket),
+            // Daemons spawn with the socket's key; earlier builds, as typed.
             ProcessArgv::Joined(joined) => {
-                joined.contains(" __daemon") && joined_serves_socket(joined, socket)
+                joined.contains(" __daemon")
+                    && (joined_serves_socket(joined, &daemon::socket_key(socket))
+                        || joined_serves_socket(joined, socket))
             }
         }
     }
@@ -339,30 +342,30 @@ pub(crate) fn handle_daemon_command(
             // Identity, not `kill(pid, 0)`: an exited daemon stays a zombie until
             // its parent reaps it, which a subreaper may never do. The budget
             // outlasts the daemon's 3s pane drain.
-            let mut gone = false;
-            for _ in 0..100 {
-                if !is_live_shux_daemon(p, socket) {
-                    gone = true;
-                    break;
-                }
+            const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+            let deadline = std::time::Instant::now() + STOP_TIMEOUT;
+            let mut gone = !is_live_shux_daemon(p, socket);
+            while !gone && std::time::Instant::now() < deadline {
                 std::thread::sleep(std::time::Duration::from_millis(50));
+                gone = !is_live_shux_daemon(p, socket);
             }
             // Nothing is unlinked here: the daemon removes its own socket and
             // pidfile on the way out, and by now a client may have started its
             // successor, whose files these would be.
-            match (format, gone) {
-                (cli::OutputFormat::Json, _) => {
-                    println!("{{\"stopped\": {gone}, \"pid\": {p}}}")
-                }
-                (_, true) => println!(
+            if let cli::OutputFormat::Json = format {
+                println!("{{\"stopped\": {gone}, \"pid\": {p}}}");
+            } else if gone {
+                println!(
                     "{} {}",
                     style::success("daemon stopped"),
                     style::muted(format!("pid {p}"))
-                ),
-                (_, false) => {}
+                );
             }
             if !gone {
-                anyhow::bail!("daemon (pid {p}) did not exit within 5s");
+                anyhow::bail!(
+                    "daemon (pid {p}) did not exit within {}s",
+                    STOP_TIMEOUT.as_secs()
+                );
             }
             Ok(())
         }
@@ -888,6 +891,19 @@ mod tests {
             "/opt/shux __daemon --socket /a/x.sock --verbose",
             Path::new("/a/x.sock")
         ));
+    }
+
+    /// A space-joined argv carrying the socket's key serves every spelling of it.
+    #[test]
+    fn a_joined_argv_serves_every_spelling_of_its_key() {
+        let spelling = Path::new("/nonexistent-shux-test/sub/../x.sock");
+        let key = super::daemon::socket_key(spelling);
+        assert_ne!(key, spelling);
+        let joined =
+            super::ProcessArgv::Joined(format!("/opt/shux __daemon --socket {}", key.display()));
+        assert!(joined.serves(spelling));
+        assert!(joined.serves(&key));
+        assert!(!joined.serves(Path::new("/nonexistent-shux-test/y.sock")));
     }
 
     /// An argv with no `--socket` is nobody's daemon, on either platform.

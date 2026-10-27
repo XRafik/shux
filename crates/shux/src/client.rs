@@ -40,9 +40,14 @@ const STALE_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 /// stopped or wedged: it is reported, never replaced.
 const VERSION_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How many stale daemons one client stops before giving up: each stop ends an
+/// identified process, so only clients of another build racing to start their
+/// own could keep producing more.
+const MAX_STALE_STOPS: u32 = 8;
+
 /// How long to wait for another client to finish starting the daemon. Covers
-/// the holder's stale-daemon wait plus its full connect backoff.
-const START_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
+/// the holder's stale-daemon stops, a drain, and its full connect backoff.
+const START_LOCK_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
@@ -58,16 +63,22 @@ pub enum ClientError {
     )]
     StaleDaemonAlive(u32),
     #[error(
-        "a daemon for this socket{0} is still running but has not served it for 5s; \
-         run `shux daemon stop` and retry"
+        "a daemon for this socket{} is still running but has not served it for {}s; \
+         run `shux daemon stop` and retry",
+        .0, STALE_EXIT_TIMEOUT.as_secs()
     )]
     DaemonNotServing(String),
     #[error(
-        "the daemon serving {}{} did not answer within 5s; it may be stopped or \
+        "the daemon serving {}{} did not answer within {}s; it may be stopped or \
          wedged -- run `shux daemon stop`, or kill it",
-        .1.display(), .0
+        .1.display(), .0, VERSION_CHECK_TIMEOUT.as_secs()
     )]
     DaemonUnresponsive(String, std::path::PathBuf),
+    #[error(
+        "stopped {MAX_STALE_STOPS} daemons from another shux build on this socket and \
+         another took over each time; stop the other build's clients and retry"
+    )]
+    StaleDaemonsKeepStarting,
     #[error(
         "{} is served by something other than a shux daemon of this build, and no \
          shux daemon process serves it; stop that process and retry",
@@ -126,48 +137,28 @@ async fn check_daemon_version(stream: &mut UnixStream) -> Option<DaemonVersion> 
     Some(DaemonVersion { version, git_sha })
 }
 
-/// SIGTERM our daemon for `socket`, returning its pid so the caller can wait
-/// for it to exit. Nothing is unlinked: the departing daemon removes its own
-/// files, and the next one replaces whatever it leaves.
-fn kill_stale_daemon(socket: &Path) -> Option<u32> {
-    let pid = crate::daemon_boot::our_live_daemon(socket)?;
-    match nix::sys::signal::kill(
-        nix::unistd::Pid::from_raw(pid as i32),
-        nix::sys::signal::Signal::SIGTERM,
-    ) {
-        Ok(()) => {
-            info!(pid, "Sent SIGTERM to stale daemon");
-            Some(pid)
-        }
-        Err(e) => {
-            debug!(pid, error = %e, "SIGTERM failed; the daemon is already gone");
-            None
-        }
-    }
-}
-
-/// Wait for a stale daemon that was sent SIGTERM to exit.
+/// Stop the stale daemon for `socket`, and wait for it to exit.
 ///
 /// Identity rather than bare liveness: a zombie under a non-reaping init still
-/// answers `kill(pid, 0)`.
-async fn wait_for_stale_exit(socket: &Path, pid: u32) -> Result<(), ClientError> {
-    let deadline = tokio::time::Instant::now() + STALE_EXIT_TIMEOUT;
-    while crate::daemon_boot::is_live_shux_daemon(pid, socket) {
-        if tokio::time::Instant::now() >= deadline {
-            return Err(ClientError::StaleDaemonAlive(pid));
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    Ok(())
-}
-
-/// Stop the stale daemon for `socket`.
-///
-/// A server that is not one of our daemons is left alone: unlinking its socket
-/// would strand it running and unreachable.
+/// answers `kill(pid, 0)`. A server that is not one of our daemons is left
+/// alone: unlinking its socket would strand it running and unreachable.
 async fn stop_stale_daemon(socket: &Path) -> Result<(), ClientError> {
-    if let Some(pid) = kill_stale_daemon(socket) {
-        return wait_for_stale_exit(socket, pid).await;
+    let pid = crate::daemon_boot::our_live_daemon(socket);
+    if let Some(pid) = pid {
+        // ESRCH means it is already gone, which the wait below sees too.
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid as i32),
+            nix::sys::signal::Signal::SIGTERM,
+        );
+        info!(pid, "Sent SIGTERM to stale daemon");
+        let deadline = tokio::time::Instant::now() + STALE_EXIT_TIMEOUT;
+        while crate::daemon_boot::is_live_shux_daemon(pid, socket) {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(ClientError::StaleDaemonAlive(pid));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        return Ok(());
     }
     for _ in 0..20 {
         if probe_socket(socket).await.is_err() {
@@ -240,11 +231,6 @@ async fn probe_daemon(socket_path: &Path) -> Result<Probe, ClientError> {
     }
 }
 
-/// How many stale daemons one client stops before giving up: each stop ends an
-/// identified process, so only clients of another build racing to start their
-/// own could keep producing more.
-const MAX_STALE_STOPS: u32 = 8;
-
 /// Under the start lock: the daemon serving `socket`, or `None` once nothing
 /// owns it and a new one may start.
 ///
@@ -264,13 +250,15 @@ async fn claim_socket(socket: &Path) -> Result<Option<UnixStream>, ClientError> 
                     socket.to_path_buf(),
                 ));
             }
-            Probe::Stale if stops < MAX_STALE_STOPS => {
+            Probe::Stale if stops == MAX_STALE_STOPS => {
+                return Err(ClientError::StaleDaemonsKeepStarting);
+            }
+            Probe::Stale => {
                 stops += 1;
                 stop_stale_daemon(socket).await?;
                 deadline = tokio::time::Instant::now() + STALE_EXIT_TIMEOUT;
                 continue;
             }
-            Probe::Stale => {}
             Probe::Absent => {
                 if daemon::try_lock_file(&lock_path)?.is_some() {
                     return Ok(None);
@@ -377,14 +365,12 @@ fn start_daemon_process(socket_path: &Path) -> Result<(), ClientError> {
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("__daemon");
 
-    // Tell the daemon which socket to serve, explicitly. `--socket` is a
-    // client-side flag and the re-exec carried neither it nor a guarantee that
-    // `SHUX_SOCKET` was set, so the daemon fell back to the default path while
-    // the client went on probing the one it was asked for. The two never met:
-    // the client retried, gave up, and left a perfectly healthy daemon behind
-    // with nothing referencing it — once per invocation, each overwriting the
-    // pidfile so `daemon stop` could only reap the last.
-    cmd.arg("--socket").arg(socket_path);
+    // Tell the daemon which socket to serve, explicitly: `--socket` is a
+    // client-side flag and `SHUX_SOCKET` may be unset. Pass the key, not the
+    // spelling: identity checks on platforms with only a space-joined argv
+    // match it textually, and a relative path would resolve against the cwd
+    // of whoever checks.
+    cmd.arg("--socket").arg(daemon::socket_key(socket_path));
 
     // Detach: don't inherit stdin/stdout/stderr
     cmd.stdin(std::process::Stdio::null());
