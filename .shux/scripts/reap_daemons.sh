@@ -91,7 +91,11 @@ set +u
 for pid in "${daemon_children[@]:-}"; do
   [ -n "${pid}" ] || continue
   pid_is_gone "${pid}" && continue
-  [ "$(ps -p "${pid}" -o ppid= 2>/dev/null | tr -d '[:space:]')" = "1" ] || continue
+  # Init, or still the daemon: a multi-threaded daemon reads as a zombie once its leader
+  # thread exits, and its children keep naming it as parent until the rest of its threads
+  # have torn down — which can be after `terminate_pids` has called it gone.
+  ppid="$(ps -p "${pid}" -o ppid= 2>/dev/null | tr -d '[:space:]')"
+  [ "${ppid}" = "1" ] || pid_in_list "${ppid}" "${pids[@]}" || continue
   stranded+=("${pid}")
 done
 set -u
