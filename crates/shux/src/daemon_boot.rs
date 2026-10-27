@@ -33,11 +33,12 @@ pub fn run_daemon(socket_override: Option<PathBuf>) -> anyhow::Result<()> {
         None => daemon::socket_path()?,
     };
 
-    // Step 1: Daemonize BEFORE tokio
-    if !daemon::daemonize(&sock_path)? {
-        // We are the parent — exit cleanly
-        return Ok(());
-    }
+    // Step 1: Daemonize BEFORE tokio. The instance lock is held until this
+    // function returns, which is after the socket and pidfile are removed.
+    let _instance_lock = match daemon::daemonize(&sock_path)? {
+        daemon::Daemonized::Daemon(lock) => lock,
+        daemon::Daemonized::Parent | daemon::Daemonized::AlreadyRunning => return Ok(()),
+    };
 
     // Step 2: Now we are the daemon process — create tokio runtime
     let rt = tokio::runtime::Runtime::new()?;

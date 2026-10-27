@@ -26,6 +26,19 @@ pub enum DaemonError {
     Setsid(nix::Error),
     #[error("signal handler registration failed: {0}")]
     Signal(io::Error),
+    #[error("failed to lock daemon lock file: {0}")]
+    Lock(io::Error),
+}
+
+/// Which process `daemonize` returned in.
+pub enum Daemonized {
+    /// The process that called `daemonize`.
+    Parent,
+    /// The daemon. Holds the instance lock; dropping it releases the socket.
+    Daemon(fs::File),
+    /// A daemon for this socket was already running, so this one must exit
+    /// without touching the socket or the pidfile.
+    AlreadyRunning,
 }
 
 /// Resolve the runtime directory for shux.
@@ -84,6 +97,43 @@ pub fn pid_file_candidates(socket: &Path) -> Result<Vec<PathBuf>, DaemonError> {
     } else {
         vec![primary, legacy]
     })
+}
+
+/// Lock file a live daemon for `socket` holds for its whole lifetime.
+///
+/// Never unlinked: a lock on an unlinked inode excludes nobody, so a daemon
+/// removing it on shutdown would let a successor lock a fresh file while the
+/// predecessor still owns the socket.
+pub fn instance_lock_path_for(socket: &Path) -> Result<PathBuf, DaemonError> {
+    Ok(pid_file_path_for(socket)?.with_extension("lock"))
+}
+
+/// Lock file clients hold while checking for, replacing or starting the daemon
+/// for `socket`. Distinct from the instance lock, which the daemon being
+/// started has to be able to take while its starter still holds this one.
+pub fn start_lock_path_for(socket: &Path) -> Result<PathBuf, DaemonError> {
+    Ok(pid_file_path_for(socket)?.with_extension("start.lock"))
+}
+
+/// Take an exclusive `flock` on `path` without blocking.
+///
+/// `Ok(None)` means another process holds it. The lock lives as long as the
+/// returned file, and std opens it `O_CLOEXEC`, so pane children never inherit
+/// it and outlive the daemon holding it.
+pub fn try_lock_file(path: &Path) -> Result<Option<fs::File>, DaemonError> {
+    let mut opts = fs::OpenOptions::new();
+    opts.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600).custom_flags(nix::libc::O_NOFOLLOW);
+    }
+    let file = opts.open(path).map_err(DaemonError::Lock)?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(fs::TryLockError::WouldBlock) => Ok(None),
+        Err(fs::TryLockError::Error(e)) => Err(DaemonError::Lock(e)),
+    }
 }
 
 /// Read a pid from an explicit pidfile path.
@@ -217,17 +267,16 @@ pub fn remove_socket_file_for(socket: &Path) -> Result<(), DaemonError> {
 /// 3. Second fork: session leader exits, grandchild continues
 ///    (grandchild cannot accidentally acquire a controlling terminal)
 /// 4. Redirect stdin/stdout/stderr to /dev/null
-/// 5. Write PID file
-///
-/// Returns `Ok(true)` in the daemon process, `Ok(false)` in the original parent.
-pub fn daemonize(socket: &Path) -> Result<bool, DaemonError> {
+/// 5. Take the instance lock, or report `AlreadyRunning`
+/// 6. Write PID file
+pub fn daemonize(socket: &Path) -> Result<Daemonized, DaemonError> {
     use nix::unistd::{ForkResult, fork, setsid};
 
     // SAFETY: This is called before any tokio runtime is created, so the process
     // is single-threaded. fork() is safe in single-threaded processes.
     match unsafe { fork() }.map_err(DaemonError::Fork)? {
         ForkResult::Parent { .. } => {
-            return Ok(false);
+            return Ok(Daemonized::Parent);
         }
         ForkResult::Child => {}
     }
@@ -248,11 +297,19 @@ pub fn daemonize(socket: &Path) -> Result<bool, DaemonError> {
     // Redirect stdio to /dev/null
     redirect_stdio_to_devnull();
 
-    // Ensure runtime dir exists and write PID file
     ensure_runtime_dir()?;
+    // Both checks come before anything that names this process as the daemon:
+    // a loser that wrote the pidfile or unlinked the socket would strand the
+    // winner. The connect probe covers a daemon that predates the lock.
+    let Some(lock) = try_lock_file(&instance_lock_path_for(socket)?)? else {
+        return Ok(Daemonized::AlreadyRunning);
+    };
+    if std::os::unix::net::UnixStream::connect(socket).is_ok() {
+        return Ok(Daemonized::AlreadyRunning);
+    }
     write_pid_file(socket)?;
 
-    Ok(true)
+    Ok(Daemonized::Daemon(lock))
 }
 
 /// Redirect stdin, stdout, stderr to /dev/null.
@@ -535,6 +592,73 @@ mod tests {
         // Pinned literally: calling the same pure function twice proves nothing
         // about the cross-version stability this file actually needs.
         assert_eq!(one.file_name().unwrap(), "shux-36a9fb754e91bc3b.pid");
+
+        unsafe { restore_xdg_runtime_dir(original) };
+    }
+
+    #[test]
+    fn a_held_lock_file_excludes_a_second_holder_until_dropped() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("shux.lock");
+
+        let first = try_lock_file(&path).unwrap().expect("uncontended lock");
+        assert!(
+            try_lock_file(&path).unwrap().is_none(),
+            "a second open of a held lock must be refused"
+        );
+        drop(first);
+        assert!(
+            try_lock_file(&path).unwrap().is_some(),
+            "dropping the holder must release the lock"
+        );
+        assert!(path.exists(), "the lock file must outlive its holder");
+    }
+
+    #[test]
+    fn lock_files_are_private_and_refuse_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("shux.lock");
+        drop(try_lock_file(&path).unwrap());
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "lock file mode {mode:o}");
+
+        let victim = tmp.path().join("victim");
+        fs::write(&victim, b"KEEP ME").unwrap();
+        let link = tmp.path().join("linked.lock");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        assert!(try_lock_file(&link).is_err(), "followed a planted symlink");
+        assert_eq!(fs::read(&victim).unwrap(), b"KEEP ME");
+    }
+
+    #[test]
+    fn lock_paths_are_keyed_to_the_socket_and_never_the_pidfile() {
+        let _guard = env_lock().lock().unwrap();
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let original = std::env::var("XDG_RUNTIME_DIR").ok();
+        // SAFETY: Guarded by ENV_LOCK and restored before releasing it.
+        unsafe { set_xdg_runtime_dir(tmpdir.path()) };
+
+        let default_sock = socket_path().unwrap();
+        let other = Path::new("/run/x/one.sock");
+        let dir = runtime_dir().unwrap();
+        assert_eq!(
+            instance_lock_path_for(&default_sock).unwrap(),
+            dir.join("shux.lock")
+        );
+        assert_eq!(
+            start_lock_path_for(&default_sock).unwrap(),
+            dir.join("shux.start.lock")
+        );
+        assert_eq!(
+            instance_lock_path_for(other).unwrap(),
+            dir.join("shux-36a9fb754e91bc3b.lock")
+        );
+        assert_ne!(
+            instance_lock_path_for(other).unwrap(),
+            pid_file_path_for(other).unwrap(),
+            "the pidfile is unlinked on shutdown; the lock must not be"
+        );
 
         unsafe { restore_xdg_runtime_dir(original) };
     }

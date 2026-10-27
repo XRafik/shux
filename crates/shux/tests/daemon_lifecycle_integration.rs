@@ -635,3 +635,182 @@ fn the_legacy_pidfile_is_not_claimed_by_a_daemon_serving_another_socket() {
         "the default daemon was stopped by a client asking about another socket"
     );
 }
+
+/// Pids of every daemon serving `socket`, by argv.
+///
+/// `socket` lives in a per-test tempdir, so the needle is unique to this run;
+/// `ps` is a machine-wide view and a shared needle would count other suites.
+fn daemons_serving(socket: &Path) -> Vec<i32> {
+    let needle = format!("__daemon --socket {}", socket.display());
+    let out = Command::new("ps")
+        .args(["-ww", "-Ao", "pid=,command="])
+        .output()
+        .expect("run ps");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|line| line.trim_end().ends_with(&needle))
+        .filter_map(|line| line.split_whitespace().next()?.parse().ok())
+        .collect()
+}
+
+/// Poll until exactly `n` daemons serve `socket`, returning the last count seen.
+fn settle_daemon_count(socket: &Path, n: usize, reaper: &mut Reaper) -> usize {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let pids = daemons_serving(socket);
+        for pid in &pids {
+            if !reaper.0.contains(pid) {
+                reaper.0.push(*pid);
+            }
+        }
+        if pids.len() == n || Instant::now() >= deadline {
+            return pids.len();
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Concurrent first-use clients must start one daemon, and `daemon stop` must
+/// leave none (#193).
+///
+/// The check-then-spawn in the client was not serialised across processes, so
+/// every racing client saw "no daemon" and spawned its own; each new daemon
+/// unlinked the previous one's socket and overwrote the pidfile, leaving all
+/// but the last running and unreachable.
+#[test]
+fn concurrent_first_use_clients_start_exactly_one_daemon() {
+    let runtime = tempfile::tempdir().expect("temp runtime");
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_shux"));
+    let socket = runtime.path().join("shux").join("shux.sock");
+    let mut reaper = Reaper(Vec::new());
+
+    let clients: Vec<_> = (0..8)
+        .map(|_| {
+            Command::new(&bin)
+                .args(["session", "list"])
+                .env("XDG_RUNTIME_DIR", runtime.path())
+                .env("NO_COLOR", "1")
+                .env("SHELL", "/bin/sh")
+                .env_remove("SHUX_SOCKET")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn shux")
+        })
+        .collect();
+    for client in clients {
+        let out = client.wait_with_output().expect("wait for shux");
+        assert!(
+            out.status.success(),
+            "a concurrent first-use client failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let running = settle_daemon_count(&socket, 1, &mut reaper);
+    assert_eq!(running, 1, "{running} daemons serve one socket");
+
+    let stopped = run_bin(&bin, runtime.path(), None, &["daemon", "stop"]);
+    assert!(stopped.status.success(), "daemon stop failed");
+    let left = settle_daemon_count(&socket, 0, &mut reaper);
+    assert_eq!(left, 0, "{left} daemon(s) survived `daemon stop`");
+}
+
+/// A daemon started on a socket another daemon already serves must exit, not
+/// steal the socket and strand the first one (#193).
+#[test]
+fn a_second_daemon_on_a_served_socket_exits() {
+    let runtime = tempfile::tempdir().expect("temp runtime");
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_shux"));
+    let socket = runtime.path().join("shux").join("shux.sock");
+    let mut reaper = Reaper(Vec::new());
+
+    assert!(
+        run_bin(&bin, runtime.path(), None, &["session", "list"])
+            .status
+            .success()
+    );
+    let first = wait_for_pid_file(&runtime.path().join("shux").join("shux.pid"));
+    reaper.0.push(first as i32);
+
+    let late = run_bin(
+        &bin,
+        runtime.path(),
+        None,
+        &[
+            "__daemon",
+            "--socket",
+            socket.to_str().expect("utf-8 socket"),
+        ],
+    );
+    assert!(late.status.success(), "__daemon parent failed");
+
+    let running = settle_daemon_count(&socket, 1, &mut reaper);
+    assert_eq!(running, 1, "{running} daemons serve one socket");
+    assert_eq!(
+        daemons_serving(&socket),
+        vec![first as i32],
+        "the late daemon replaced the one already serving"
+    );
+    assert_eq!(
+        try_read_pid(&runtime.path().join("shux").join("shux.pid")),
+        Some(first),
+        "the late daemon overwrote the pidfile"
+    );
+    assert!(
+        run_bin(&bin, runtime.path(), None, &["session", "list"])
+            .status
+            .success(),
+        "the first daemon stopped answering"
+    );
+
+    let stopped = run_bin(&bin, runtime.path(), None, &["daemon", "stop"]);
+    assert!(stopped.status.success(), "daemon stop failed");
+    assert!(
+        wait_for_pid_gone(first, Duration::from_secs(5)),
+        "daemon stop left the first daemon running"
+    );
+}
+
+/// A daemon must not take over a socket a server without the instance lock is
+/// already serving — a daemon from before the lock existed, at an upgrade.
+#[test]
+fn a_daemon_leaves_a_socket_a_lockless_server_already_serves() {
+    let runtime = tempfile::tempdir().expect("temp runtime");
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_shux"));
+    let dir = runtime.path().join("shux");
+    std::fs::create_dir_all(&dir).expect("mkdir runtime");
+    let socket = dir.join("shux.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind fake server");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let mut reaper = Reaper(Vec::new());
+
+    let late = run_bin(
+        &bin,
+        runtime.path(),
+        None,
+        &[
+            "__daemon",
+            "--socket",
+            socket.to_str().expect("utf-8 socket"),
+        ],
+    );
+    assert!(late.status.success(), "__daemon parent failed");
+
+    // The daemon's probe connects here before it gives up; waiting for it means
+    // the count below cannot read zero merely because it has not started yet.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while listener.accept().is_err() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    let running = settle_daemon_count(&socket, 0, &mut reaper);
+    assert_eq!(running, 0, "a daemon is running beside the server");
+    assert!(
+        std::os::unix::net::UnixStream::connect(&socket).is_ok() && listener.accept().is_ok(),
+        "the daemon replaced the socket the server was listening on"
+    );
+    assert!(
+        !dir.join("shux.pid").exists(),
+        "a daemon that did not start wrote the pidfile"
+    );
+}
