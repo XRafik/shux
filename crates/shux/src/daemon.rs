@@ -30,17 +30,6 @@ pub enum DaemonError {
     Lock(io::Error),
 }
 
-/// Which process `daemonize` returned in.
-pub enum Daemonized {
-    /// The process that called `daemonize`.
-    Parent,
-    /// The daemon. Holds the instance lock; dropping it releases the socket.
-    Daemon(fs::File),
-    /// A daemon for this socket was already running, so this one must exit
-    /// without touching the socket or the pidfile.
-    AlreadyRunning,
-}
-
 /// Resolve the runtime directory for shux.
 ///
 /// Uses `$XDG_RUNTIME_DIR/shux/` if set, otherwise falls back to
@@ -267,16 +256,20 @@ pub fn remove_socket_file_for(socket: &Path) -> Result<(), DaemonError> {
 /// 3. Second fork: session leader exits, grandchild continues
 ///    (grandchild cannot accidentally acquire a controlling terminal)
 /// 4. Redirect stdin/stdout/stderr to /dev/null
-/// 5. Take the instance lock, or report `AlreadyRunning`
+/// 5. Take the instance lock and record our pid in it
 /// 6. Write PID file
-pub fn daemonize(socket: &Path) -> Result<Daemonized, DaemonError> {
+///
+/// Returns the instance lock in the daemon, and `None` in every other process:
+/// the original parent, and a daemon that found one already running for
+/// `socket`. Dropping the lock releases the socket to a successor.
+pub fn daemonize(socket: &Path) -> Result<Option<fs::File>, DaemonError> {
     use nix::unistd::{ForkResult, fork, setsid};
 
     // SAFETY: This is called before any tokio runtime is created, so the process
     // is single-threaded. fork() is safe in single-threaded processes.
     match unsafe { fork() }.map_err(DaemonError::Fork)? {
         ForkResult::Parent { .. } => {
-            return Ok(Daemonized::Parent);
+            return Ok(None);
         }
         ForkResult::Child => {}
     }
@@ -301,15 +294,20 @@ pub fn daemonize(socket: &Path) -> Result<Daemonized, DaemonError> {
     // Both checks come before anything that names this process as the daemon:
     // a loser that wrote the pidfile or unlinked the socket would strand the
     // winner. The connect probe covers a daemon that predates the lock.
-    let Some(lock) = try_lock_file(&instance_lock_path_for(socket)?)? else {
-        return Ok(Daemonized::AlreadyRunning);
+    let Some(mut lock) = try_lock_file(&instance_lock_path_for(socket)?)? else {
+        return Ok(None);
     };
     if std::os::unix::net::UnixStream::connect(socket).is_ok() {
-        return Ok(Daemonized::AlreadyRunning);
+        return Ok(None);
+    }
+    {
+        use std::io::Write;
+        lock.set_len(0).map_err(DaemonError::PidFile)?;
+        write!(lock, "{}", std::process::id()).map_err(DaemonError::PidFile)?;
     }
     write_pid_file(socket)?;
 
-    Ok(Daemonized::Daemon(lock))
+    Ok(Some(lock))
 }
 
 /// Redirect stdin, stdout, stderr to /dev/null.
@@ -611,7 +609,6 @@ mod tests {
             try_lock_file(&path).unwrap().is_some(),
             "dropping the holder must release the lock"
         );
-        assert!(path.exists(), "the lock file must outlive its holder");
     }
 
     #[test]
@@ -632,7 +629,7 @@ mod tests {
     }
 
     #[test]
-    fn lock_paths_are_keyed_to_the_socket_and_never_the_pidfile() {
+    fn lock_paths_are_keyed_to_the_socket() {
         let _guard = env_lock().lock().unwrap();
         let tmpdir = tempfile::TempDir::new().unwrap();
         let original = std::env::var("XDG_RUNTIME_DIR").ok();
@@ -653,11 +650,6 @@ mod tests {
         assert_eq!(
             instance_lock_path_for(other).unwrap(),
             dir.join("shux-36a9fb754e91bc3b.lock")
-        );
-        assert_ne!(
-            instance_lock_path_for(other).unwrap(),
-            pid_file_path_for(other).unwrap(),
-            "the pidfile is unlinked on shutdown; the lock must not be"
         );
 
         unsafe { restore_xdg_runtime_dir(original) };

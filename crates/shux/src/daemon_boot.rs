@@ -35,9 +35,8 @@ pub fn run_daemon(socket_override: Option<PathBuf>) -> anyhow::Result<()> {
 
     // Step 1: Daemonize BEFORE tokio. The instance lock is held until this
     // function returns, which is after the socket and pidfile are removed.
-    let _instance_lock = match daemon::daemonize(&sock_path)? {
-        daemon::Daemonized::Daemon(lock) => lock,
-        daemon::Daemonized::Parent | daemon::Daemonized::AlreadyRunning => return Ok(()),
+    let Some(_instance_lock) = daemon::daemonize(&sock_path)? else {
+        return Ok(());
     };
 
     // Step 2: Now we are the daemon process — create tokio runtime
@@ -202,7 +201,7 @@ fn same_socket(a: &Path, b: &Path) -> bool {
 /// comes from the process's own argv. Deliberately NOT the executable name -- requiring the
 /// basename `shux` disowned every renamed build and orphaned its daemon. The served socket is
 /// what makes a daemon *ours* rather than merely *a shux daemon*.
-fn is_live_shux_daemon(pid: u32, socket: &Path) -> bool {
+pub(crate) fn is_live_shux_daemon(pid: u32, socket: &Path) -> bool {
     if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_err() {
         return false;
     }
@@ -243,16 +242,24 @@ pub(crate) struct LiveDaemon {
 /// `daemon stop`, and the version-mismatch restart in `client::kill_stale_daemon`
 /// -- which had none and SIGTERMed whatever the pidfile held. pid 0 and 1 are
 /// rejected: `kill(0, ..)` signals the process group and pid 1 is init.
+///
+/// The instance lock records its holder's pid too, so a daemon whose pidfile
+/// was lost is still found. The lock file itself is never reported as the
+/// pidfile: callers delete that, and the lock must not be unlinked.
 pub(crate) fn our_live_daemon(socket: &Path) -> Option<LiveDaemon> {
+    let live = |path: &Path| {
+        daemon::read_pid_at(path).filter(|&pid| pid > 1 && is_live_shux_daemon(pid, socket))
+    };
     for pidfile in daemon::pid_file_candidates(socket).ok()? {
-        if let Some(pid) = daemon::read_pid_at(&pidfile)
-            && pid > 1
-            && is_live_shux_daemon(pid, socket)
-        {
+        if let Some(pid) = live(&pidfile) {
             return Some(LiveDaemon { pid, pidfile });
         }
     }
-    None
+    let pid = live(&daemon::instance_lock_path_for(socket).ok()?)?;
+    Some(LiveDaemon {
+        pid,
+        pidfile: daemon::pid_file_path_for(socket).ok()?,
+    })
 }
 
 /// `shux daemon stop|status` — the missing half of the daemon lifecycle (085 F5).

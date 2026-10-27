@@ -672,11 +672,6 @@ fn settle_daemon_count(socket: &Path, n: usize, reaper: &mut Reaper) -> usize {
 
 /// Concurrent first-use clients must start one daemon, and `daemon stop` must
 /// leave none (#193).
-///
-/// The check-then-spawn in the client was not serialised across processes, so
-/// every racing client saw "no daemon" and spawned its own; each new daemon
-/// unlinked the previous one's socket and overwrote the pidfile, leaving all
-/// but the last running and unreachable.
 #[test]
 fn concurrent_first_use_clients_start_exactly_one_daemon() {
     let runtime = tempfile::tempdir().expect("temp runtime");
@@ -813,4 +808,115 @@ fn a_daemon_leaves_a_socket_a_lockless_server_already_serves() {
         !dir.join("shux.pid").exists(),
         "a daemon that did not start wrote the pidfile"
     );
+}
+
+/// A client that arrives while the daemon drains its panes must get a fresh
+/// daemon once the old one exits, not a spawn that loses to the departing
+/// daemon's instance lock and a connect that times out.
+#[test]
+fn a_client_during_a_daemon_drain_gets_the_next_daemon() {
+    let h = ShuxHarness::new();
+    let socket = h.runtime_dir().join("shux").join("shux.sock");
+    let work = tempfile::tempdir().expect("work dir");
+    let pane_pidfile = work.path().join("pane.pid");
+    let mut reaper = Reaper(Vec::new());
+
+    // Ignores SIGTERM and SIGHUP, so the daemon drains for its full budget.
+    h.create_stubborn_session("drain", work.path(), &pane_pidfile);
+    let pane = wait_for_pid_file(&pane_pidfile);
+    let old = h.daemon_pid().expect("daemon pidfile");
+    reaper.0.extend([old as i32, pane as i32]);
+
+    kill(Pid::from_raw(old as i32), Signal::SIGTERM).expect("SIGTERM daemon");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while socket.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !socket.exists() && pid_exists(old),
+        "precondition: the daemon has stopped serving but is still draining"
+    );
+
+    let out = h
+        .shux()
+        .args(["session", "list"])
+        .output()
+        .expect("run shux");
+    assert!(
+        out.status.success(),
+        "a client during the drain failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_pid_gone(old, "the draining daemon");
+    let running = settle_daemon_count(&socket, 1, &mut reaper);
+    assert_eq!(running, 1, "{running} daemons after the drain");
+    assert_pid_gone(pane, "the drained daemon's pane");
+}
+
+/// A daemon whose pidfile was lost is still the daemon for its socket: `daemon
+/// stop` must stop it rather than report "no daemon running" and leave it.
+#[test]
+fn daemon_stop_finds_a_daemon_whose_pidfile_was_lost() {
+    let runtime = tempfile::tempdir().expect("temp runtime");
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_shux"));
+    let pidfile = runtime.path().join("shux").join("shux.pid");
+    let mut reaper = Reaper(Vec::new());
+
+    assert!(
+        run_bin(&bin, runtime.path(), None, &["session", "list"])
+            .status
+            .success()
+    );
+    let pid = wait_for_pid_file(&pidfile);
+    reaper.0.push(pid as i32);
+    std::fs::remove_file(&pidfile).expect("lose the pidfile");
+
+    let stopped = run_bin(&bin, runtime.path(), None, &["daemon", "stop"]);
+    assert!(stopped.status.success(), "daemon stop failed");
+    assert!(
+        wait_for_pid_gone(pid, Duration::from_secs(5)),
+        "daemon stop left a daemon it could not name: {}",
+        String::from_utf8_lossy(&stopped.stdout)
+    );
+}
+
+/// A client must not take a socket from a server it cannot identify and cannot
+/// stop: unlinking it strands that server, still running and unreachable.
+#[test]
+fn a_client_does_not_take_the_socket_of_a_server_it_cannot_stop() {
+    let runtime = tempfile::tempdir().expect("temp runtime");
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_shux"));
+    let dir = runtime.path().join("shux");
+    std::fs::create_dir_all(&dir).expect("mkdir runtime");
+    let socket = dir.join("shux.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind fake server");
+    // Accepts and hangs up: the client cannot read a version, so it is stale,
+    // and no pidfile names it.
+    let server = thread::spawn(move || {
+        for conn in listener.incoming() {
+            match conn {
+                Ok(conn) => drop(conn),
+                Err(_) => break,
+            }
+        }
+    });
+    let mut reaper = Reaper(Vec::new());
+
+    let out = run_bin(&bin, runtime.path(), None, &["session", "list"]);
+    assert!(
+        !out.status.success(),
+        "a client replaced a server it could not stop"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no pidfile names"),
+        "the error must say why: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let running = settle_daemon_count(&socket, 0, &mut reaper);
+    assert_eq!(running, 0, "a daemon was started beside the server");
+    assert!(
+        std::os::unix::net::UnixStream::connect(&socket).is_ok(),
+        "the server's socket was unlinked"
+    );
+    drop(server);
 }

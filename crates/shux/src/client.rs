@@ -6,9 +6,6 @@
 //! On successful connection, the client performs a version handshake: if the
 //! running daemon's version differs from the client binary's version (e.g.,
 //! after a rebuild), the stale daemon is killed and a fresh one is spawned.
-//!
-//! Everything past a successful probe of a current daemon runs under a
-//! per-socket start lock, so concurrent first-use clients start one daemon.
 
 use std::io;
 use std::path::Path;
@@ -35,8 +32,8 @@ const INITIAL_BACKOFF: Duration = Duration::from_millis(50);
 /// Maximum backoff delay.
 const MAX_BACKOFF: Duration = Duration::from_millis(2000);
 
-/// How long a stale daemon gets to exit after SIGTERM. It drains panes for up
-/// to 3s before it unlinks the socket.
+/// How long a daemon gets to exit after it stops serving. It drains panes for
+/// up to 3s before it releases the instance lock.
 const STALE_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long to wait for another client to finish starting the daemon. Covers
@@ -56,6 +53,17 @@ pub enum ClientError {
          it may be draining a session -- retry, or run `shux daemon stop`"
     )]
     StaleDaemonAlive(u32),
+    #[error(
+        "a daemon for this socket{0} is still running but no longer serving it; \
+         it may be shutting down -- retry, or run `shux daemon stop`"
+    )]
+    DaemonNotServing(String),
+    #[error(
+        "{} is served by a daemon from another shux build that no pidfile names; \
+         stop that process and retry",
+        .0.display()
+    )]
+    StaleDaemonUnidentified(std::path::PathBuf),
     #[error("timed out waiting for another shux client to start the daemon (lock {})", .0.display())]
     StartLockTimeout(std::path::PathBuf),
 }
@@ -139,32 +147,53 @@ fn kill_stale_daemon(socket: &Path) -> Option<u32> {
     }
 }
 
-/// Wait for the stale daemon to exit.
+/// Wait for a stale daemon that was sent SIGTERM to exit.
 ///
-/// With a pid, wait for the process itself: its replacement cannot take the
-/// instance lock until it is gone, and the old daemon unlinks the socket as its
-/// last act, so a replacement bound any earlier would be stranded. Without one
-/// (a daemon the pidfile no longer names), the socket is all there is to go on.
-async fn wait_for_daemon_exit(socket_path: &Path, pid: Option<u32>) -> Result<(), ClientError> {
-    if let Some(pid) = pid {
-        let deadline = tokio::time::Instant::now() + STALE_EXIT_TIMEOUT;
-        while nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok() {
-            if tokio::time::Instant::now() >= deadline {
-                return Err(ClientError::StaleDaemonAlive(pid));
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+/// Identity rather than bare liveness: a zombie under a non-reaping init still
+/// answers `kill(pid, 0)`.
+async fn wait_for_stale_exit(socket: &Path, pid: u32) -> Result<(), ClientError> {
+    let deadline = tokio::time::Instant::now() + STALE_EXIT_TIMEOUT;
+    while crate::daemon_boot::is_live_shux_daemon(pid, socket) {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(ClientError::StaleDaemonAlive(pid));
         }
-        return Ok(());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Ok(())
+}
+
+/// Stop the stale daemon serving `socket`.
+///
+/// One that nothing names is left alone: unlinking its socket would strand it
+/// running, unreachable, and still holding the instance lock.
+async fn stop_stale_daemon(socket: &Path) -> Result<(), ClientError> {
+    if let Some(pid) = kill_stale_daemon(socket) {
+        return wait_for_stale_exit(socket, pid).await;
     }
     for _ in 0..20 {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        if probe_socket(socket_path).await.is_err() {
+        if probe_socket(socket).await.is_err() {
             return Ok(());
         }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    // Force cleanup if daemon didn't exit
-    let _ = daemon::remove_socket_file_for(socket_path);
-    let _ = daemon::remove_pid_file_for(socket_path);
+    Err(ClientError::StaleDaemonUnidentified(socket.to_path_buf()))
+}
+
+/// Wait until no daemon holds the instance lock for `socket`.
+///
+/// A daemon stops serving before it finishes draining its panes, and holds the
+/// lock until it has; a replacement spawned in that window would exit at once.
+async fn wait_for_instance_lock(socket: &Path) -> Result<(), ClientError> {
+    let path = daemon::instance_lock_path_for(socket)?;
+    let deadline = tokio::time::Instant::now() + STALE_EXIT_TIMEOUT;
+    while daemon::try_lock_file(&path)?.is_none() {
+        if tokio::time::Instant::now() >= deadline {
+            let holder =
+                daemon::read_pid_at(&path).map_or_else(String::new, |p| format!(" (pid {p})"));
+            return Err(ClientError::DaemonNotServing(holder));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     Ok(())
 }
 
@@ -238,7 +267,7 @@ async fn acquire_start_lock(socket: &Path) -> Result<std::fs::File, ClientError>
 /// 1. Try to connect to the UDS; a daemon of this build is used as is
 /// 2. Otherwise take the start lock, so concurrent clients start one daemon
 /// 3. Probe again under the lock: another client may have started it already
-/// 4. Kill a stale daemon, or spawn one if none is listening
+/// 4. Stop a stale daemon, wait for any daemon still draining, then spawn
 /// 5. Retry with exponential backoff until connected or max retries
 pub async fn ensure_daemon_running_at(socket_path: &Path) -> Result<UnixStream, ClientError> {
     if let Probe::Current(stream) = probe_daemon(socket_path).await? {
@@ -246,17 +275,14 @@ pub async fn ensure_daemon_running_at(socket_path: &Path) -> Result<UnixStream, 
     }
 
     // Held until this function returns, i.e. until the daemon it started (or
-    // found) is accepting connections. Every racing client used to see "no
-    // daemon" and spawn its own.
+    // found) is accepting connections.
     let _start_lock = acquire_start_lock(socket_path).await?;
     match probe_daemon(socket_path).await? {
         Probe::Current(stream) => return Ok(stream),
-        Probe::Stale => {
-            let pid = kill_stale_daemon(socket_path);
-            wait_for_daemon_exit(socket_path, pid).await?;
-        }
+        Probe::Stale => stop_stale_daemon(socket_path).await?,
         Probe::Absent => info!("Daemon not running, starting..."),
     }
+    wait_for_instance_lock(socket_path).await?;
 
     // Spawn the daemon process
     start_daemon_process(socket_path)?;
@@ -335,39 +361,4 @@ fn is_connection_refused_or_not_found(e: &io::Error) -> bool {
         e.kind(),
         io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A replacement cannot take the instance lock until the stale daemon has
-    /// exited, so the wait has to be on the process. The socket here never
-    /// existed, which a socket-only wait would take as "already gone".
-    #[tokio::test]
-    async fn the_stale_daemon_wait_follows_the_process_not_the_socket() {
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let socket = tmp.path().join("absent.sock");
-        let mut child = std::process::Command::new("sleep")
-            .arg("0.5")
-            .spawn()
-            .expect("spawn sleep");
-        let pid = child.id();
-        let reaper = std::thread::spawn(move || child.wait());
-
-        let started = std::time::Instant::now();
-        wait_for_daemon_exit(&socket, Some(pid))
-            .await
-            .expect("sleep exits well inside the timeout");
-        assert!(
-            started.elapsed() >= Duration::from_millis(400),
-            "returned after {:?}, before the process exited",
-            started.elapsed()
-        );
-        assert!(
-            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_err(),
-            "returned while pid {pid} was still alive"
-        );
-        reaper.join().expect("reaper").expect("wait sleep");
-    }
 }
