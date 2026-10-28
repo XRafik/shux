@@ -835,4 +835,25 @@ mod tests {
 
         unsafe { restore_xdg_runtime_dir(original) };
     }
+
+    /// Startup binds over a missing socket file, replaces a stale one, and
+    /// never replaces one that is still served.
+    #[tokio::test]
+    async fn test_remove_nonexistent_socket_file_is_ok() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let path = tmpdir.path().join("shux.sock");
+        let served = shux_rpc::uds::OwnedSocket::bind(&path).unwrap();
+        assert!(std::os::unix::net::UnixStream::connect(&path).is_ok());
+        let again = shux_rpc::uds::OwnedSocket::bind(&path);
+        assert_eq!(
+            again.err().map(|e| e.kind()),
+            Some(io::ErrorKind::AddrInUse)
+        );
+        drop(served);
+        assert!(!path.exists(), "dropping the listener removes its own file");
+        std::os::unix::net::UnixListener::bind(&path).unwrap();
+        // A stale file nobody serves is replaced.
+        let _rebound = shux_rpc::uds::OwnedSocket::bind(&path).unwrap();
+        assert!(std::os::unix::net::UnixStream::connect(&path).is_ok());
+    }
 }
