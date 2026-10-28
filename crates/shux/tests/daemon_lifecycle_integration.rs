@@ -1241,7 +1241,17 @@ fn daemon_stop_sees_a_daemon_exit_under_a_subreaper() {
         String::from_utf8_lossy(&stopped.stderr)
     );
     // Precondition, or the test proves nothing: the daemon is a zombie, not gone.
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+    // Its argv reads back empty from the moment the kernel drops its memory, a
+    // little before it turns Z, so stop can return while it still shows R.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut stat = String::new();
+    while Instant::now() < deadline {
+        stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+        if stat.contains(") Z ") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
     assert!(
         stat.contains(") Z "),
         "the daemon was reaped after all: {stat:?}"
