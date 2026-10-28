@@ -1473,6 +1473,66 @@ fn a_process_with_a_daemons_argv_is_not_signalled() {
     );
 }
 
+/// A daemon from before the socket key named its pidfile after the socket as
+/// typed and holds no instance lock, so only that pidfile names it: `daemon
+/// stop` given the same relative spelling must still find and stop it.
+#[test]
+fn a_lockless_daemon_is_stopped_by_the_spelling_it_was_started_with() {
+    let runtime = tempfile::tempdir().expect("temp runtime");
+    let cwd = tempfile::tempdir().expect("temp cwd");
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_shux"));
+    let typed = Path::new("legacy.sock");
+    std::fs::write(cwd.path().join("__daemon"), "import time\ntime.sleep(60)\n")
+        .expect("write legacy daemon");
+    let mut legacy = Command::new("python3")
+        .arg("__daemon")
+        .arg("--socket")
+        .arg(typed)
+        .current_dir(cwd.path())
+        .spawn()
+        .expect("spawn legacy daemon");
+    let pid = legacy.id();
+    let reaper = Reaper(vec![pid as i32]);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while std::fs::read(format!("/proc/{pid}/cmdline"))
+        .map_or(true, |c| !String::from_utf8_lossy(&c).contains("--socket"))
+    {
+        assert!(Instant::now() < deadline, "legacy daemon never started");
+        thread::sleep(Duration::from_millis(20));
+    }
+    // FNV-1a of the spelling: the pidfile name earlier builds wrote.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in typed.as_os_str().as_encoded_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let dir = runtime.path().join("shux");
+    std::os::unix::fs::DirBuilderExt::mode(&mut std::fs::DirBuilder::new(), 0o700)
+        .create(&dir)
+        .expect("runtime dir");
+    std::fs::write(dir.join(format!("shux-{hash:016x}.pid")), pid.to_string())
+        .expect("legacy pidfile");
+
+    let stopped = bin_cmd(&bin, runtime.path(), Some(typed), &["daemon", "stop"])
+        .current_dir(cwd.path())
+        .output()
+        .expect("run shux");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut exited = false;
+    while !exited && Instant::now() < deadline {
+        exited = legacy.try_wait().expect("poll legacy daemon").is_some();
+        thread::sleep(Duration::from_millis(20));
+    }
+    drop(reaper);
+    let _ = legacy.wait();
+    assert!(
+        exited,
+        "daemon stop missed the legacy daemon: {}{}",
+        String::from_utf8_lossy(&stopped.stdout),
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+}
+
 /// The attach socket is rebound when it is unlinked, as the RPC socket is: a
 /// daemon from before this build unlinks `attach.sock` on its way out.
 #[test]

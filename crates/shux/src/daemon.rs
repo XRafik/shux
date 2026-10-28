@@ -119,18 +119,33 @@ pub fn socket_key(socket: &Path) -> PathBuf {
     key
 }
 
+/// The socket as the user spelled it, for [`pid_file_candidates`]: the CLI
+/// passes the key everywhere else.
+static TYPED_SOCKET: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Record the `--socket` / `SHUX_SOCKET` spelling this process was given.
+pub fn remember_typed_socket(typed: &Path) {
+    let _ = TYPED_SOCKET.set(typed.to_path_buf());
+}
+
 /// Pidfile paths to consult for `socket`, most specific first.
 ///
 /// The others are where earlier versions wrote: a hash of the socket as typed,
 /// and before that `$RUNTIME_DIR/shux.pid` whatever socket was served. Skipping
-/// them would orphan the daemon being replaced at every upgrade. Safe because
-/// the caller identity-checks the pid it finds against the socket it serves.
+/// them would orphan the daemon being replaced at every upgrade, and such a
+/// daemon holds no instance lock to be found by. Safe because the caller
+/// identity-checks the pid it finds against the socket it serves.
 pub fn pid_file_candidates(socket: &Path) -> Result<Vec<PathBuf>, DaemonError> {
     let mut candidates = vec![pid_file_path_for(socket)?];
-    for older in [
-        pid_file_for_spelling(socket)?,
-        runtime_dir()?.join("shux.pid"),
-    ] {
+    let typed = TYPED_SOCKET
+        .get()
+        .filter(|typed| socket_key(typed) == socket_key(socket));
+    let mut older = vec![pid_file_for_spelling(socket)?];
+    if let Some(typed) = typed {
+        older.push(pid_file_for_spelling(typed)?);
+    }
+    older.push(runtime_dir()?.join("shux.pid"));
+    for older in older {
         if !candidates.contains(&older) {
             candidates.push(older);
         }

@@ -115,6 +115,9 @@ pub(crate) async fn run_attach(
 
 /// Dispatch CLI subcommands.
 pub(crate) async fn dispatch(args: Cli) -> anyhow::Result<()> {
+    if let Some(typed) = &args.socket {
+        crate::daemon::remember_typed_socket(typed);
+    }
     let socket_path = args.socket_path();
 
     match args.command {
