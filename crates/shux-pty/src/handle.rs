@@ -482,6 +482,25 @@ fn default_shell_argv(shell_env: Option<&str>) -> Vec<String> {
     vec![shell.to_string(), "-l".to_string(), "-i".to_string()]
 }
 
+/// Writes to a PTY child's input; see [`PtyHandle::input_writer`].
+pub struct PtyInputWriter {
+    fd: AsyncFd<OwnedFd>,
+}
+
+impl PtyInputWriter {
+    /// Waits until the child's input has room, then writes what fits.
+    /// Cancel-safe: nothing is written unless the future completes.
+    pub async fn write_some(&self, data: &[u8]) -> Result<usize, PtyError> {
+        loop {
+            let mut guard = self.fd.writable().await.map_err(PtyError::Write)?;
+            match guard.try_io(|inner| write_once(inner.get_ref().as_raw_fd(), data)) {
+                Ok(result) => return result.map_err(PtyError::Write),
+                Err(_would_block) => continue,
+            }
+        }
+    }
+}
+
 /// A handle to a running PTY child process.
 pub struct PtyHandle {
     pty: AsyncFd<OwnedFd>,
@@ -501,6 +520,23 @@ pub struct PtyHandle {
     spawned_at: std::time::Instant,
     initial_cwd: PathBuf,
     size: PtySize,
+}
+
+/// A handle dropped before its child was reaped — the owning task panicked or
+/// was aborted — kills the child's process group and reaps it, so nothing is
+/// left running with no one to wait for it. A reaped child is never signalled:
+/// its pid may already belong to someone else.
+impl Drop for PtyHandle {
+    fn drop(&mut self) {
+        if !matches!(self.child.try_wait(), Ok(None)) {
+            return;
+        }
+        let _ = self.kill();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+        while matches!(self.child.try_wait(), Ok(None)) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
 }
 
 fn nix_to_io(err: nix::Error) -> PtyError {
@@ -770,10 +806,10 @@ impl PtyHandle {
 
         let child = cmd.spawn().map_err(PtyError::Spawn)?;
         let pid = child.id();
-        // SAFETY: the `OwnedFd` moves into the `AsyncFd` and is closed only when
-        // it drops, so its fd stays open and names the same description.
-        let pty =
-            unsafe { AsyncFd::register(pty_pair.master) }.map_err(|e| PtyError::Open(e.into()))?;
+        // SAFETY: the master `OwnedFd` moves into the AsyncFd, which owns it
+        // until it drops, so the fd stays valid, open and unchanged meanwhile.
+        let pty = unsafe { AsyncFd::register(pty_pair.master) }
+            .map_err(|e| PtyError::Open(std::io::Error::from(e)))?;
 
         info!(pid, cmd = ?cmd_parts, cwd = %config.cwd.display(), "PTY child spawned");
 
@@ -866,6 +902,17 @@ impl PtyHandle {
             }
         }
         Ok(())
+    }
+
+    /// A second handle on the master for the child's input, so a task can wait
+    /// for room to write while a read is in flight.
+    pub fn input_writer(&self) -> Result<PtyInputWriter, PtyError> {
+        let fd = self.pty.get_ref().try_clone().map_err(PtyError::Write)?;
+        // SAFETY: the dup'd `OwnedFd` moves into the AsyncFd, which owns it
+        // until it drops, so the fd stays valid, open and unchanged meanwhile.
+        let fd = unsafe { AsyncFd::register(fd) }
+            .map_err(|e| PtyError::Write(std::io::Error::from(e)))?;
+        Ok(PtyInputWriter { fd })
     }
 
     pub async fn write_str(&mut self, text: &str) -> Result<(), PtyError> {

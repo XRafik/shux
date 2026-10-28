@@ -44,10 +44,12 @@ const EXPECTED_SURFACE: &[&str] = &[
     "pane.set_size => OwnedMutation",
     "pane.set_title => OwnedMutation",
     "pane.snapshot => ContentRead",
+    "pane.status => ContentRead",
     "pane.split => OwnedMutation",
     "pane.swap => OwnedMutation",
     "pane.wait_for => ContentRead",
     "pane.wait_settled => ContentRead",
+    "pane.wait_status => ContentRead",
     "pane.zoom => OwnedMutation",
     "plugin.audit => PluginsForbidden",
     "plugin.grant => PluginsForbidden",
@@ -82,8 +84,7 @@ fn describe(policy: &Policy) -> String {
         Policy::Fixed(s) => format!("{s:?}"),
         Policy::ParamAware(_) => {
             let broad = policy.resolve(None, "p");
-            let scoped =
-                policy.resolve(Some(&serde_json::json!({ "filters": ["plugin.p."] })), "p");
+            let scoped = policy.resolve(Some(&serde_json::json!({ "filter": ["plugin.p."] })), "p");
             format!("ParamAware(broad={broad:?}, self_scoped={scoped:?})")
         }
     }

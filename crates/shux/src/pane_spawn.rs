@@ -24,10 +24,83 @@ enum PtyTaskExit {
 }
 
 struct PtyTaskControl {
+    /// See [`PaneIoState::incarnations`].
+    incarnation: u64,
     write_rx: mpsc::Receiver<Vec<u8>>,
     resize_rx: mpsc::Receiver<ResizeRequest>,
     shutdown: tokio_util::sync::CancellationToken,
     done_tx: oneshot::Sender<()>,
+    input: shux_pty::PtyInputWriter,
+}
+
+/// Everything bound for the program's input, in order: terminal replies
+/// (DA1, DSR, OSC 7501 probes) and user input. Replies go between input
+/// chunks, never inside one. A reply that does not fit is dropped whole; input
+/// is never dropped — the loop stops taking more until the program reads.
+#[derive(Default)]
+struct PtyInputQueue {
+    replies: std::collections::VecDeque<u8>,
+    input: std::collections::VecDeque<Vec<u8>>,
+    /// Bytes of `input.front()` already written.
+    written: usize,
+    input_len: usize,
+}
+
+impl PtyInputQueue {
+    /// Replies stop queueing early: a program that ignores them gets none.
+    const CAP: usize = 4096;
+    /// Input queued past this waits in the pane's channel instead.
+    const INPUT_CAP: usize = 1 << 20;
+
+    fn push(&mut self, reply: &[u8]) -> bool {
+        if self.replies.len() + reply.len() > Self::CAP {
+            return false;
+        }
+        self.replies.extend(reply);
+        true
+    }
+
+    fn push_input(&mut self, data: Vec<u8>) {
+        if !data.is_empty() {
+            self.input_len += data.len();
+            self.input.push_back(data);
+        }
+    }
+
+    fn takes_input(&self) -> bool {
+        self.input_len < Self::INPUT_CAP
+    }
+
+    fn is_empty(&self) -> bool {
+        self.replies.is_empty() && self.input.is_empty()
+    }
+
+    fn replying(&self) -> bool {
+        self.written == 0 && !self.replies.is_empty()
+    }
+
+    /// The bytes to write next.
+    fn next(&mut self) -> &[u8] {
+        if self.replying() {
+            self.replies.make_contiguous()
+        } else {
+            self.input.front().map_or(&[], |c| &c[self.written..])
+        }
+    }
+
+    /// `n` bytes of [`Self::next`] were written.
+    fn consume(&mut self, n: usize) {
+        if self.replying() {
+            self.replies.drain(..n);
+            return;
+        }
+        self.written += n;
+        self.input_len -= n;
+        if self.input.front().is_some_and(|c| c.len() == self.written) {
+            self.input.pop_front();
+            self.written = 0;
+        }
+    }
 }
 
 /// Per-pane async task that owns the PtyHandle and handles both reads and writes.
@@ -44,10 +117,12 @@ async fn run_pane_pty_task(
 ) {
     use base64::Engine;
     let PtyTaskControl {
+        incarnation,
         mut write_rx,
         mut resize_rx,
         shutdown,
         done_tx,
+        input,
     } = control;
     let mut buf = vec![0u8; 8192];
     // Track the last OSC title we forwarded to the graph so we only
@@ -71,6 +146,7 @@ async fn run_pane_pty_task(
         .unwrap_or_else(std::time::Instant::now);
     let mut output_dropped_any = false;
     let mut task_exit = PtyTaskExit::Natural;
+    let mut pending = PtyInputQueue::default();
 
     loop {
         tokio::select! {
@@ -89,10 +165,16 @@ async fn run_pane_pty_task(
                     }
                     Ok(n) => {
                         let data = &buf[..n];
-                        tee_pane_recorders(&io_state, pane_id, data, &shutdown).await;
+                        tee_pane_recorders(&io_state, pane_id, Some(incarnation), data, &shutdown).await;
                         let (pulse, vt_title, bus_opt, terminal_responses) = {
                             let mut state = io_state.lock().await;
-                            let (vt_title, terminal_responses, rev_state, alt_switched) =
+                            if !state.is_current(pane_id, incarnation) {
+                                // Replaced while this read was in flight: these
+                                // bytes belong to a process the pane no longer has.
+                                task_exit = PtyTaskExit::RequestedTeardown;
+                                break;
+                            }
+                            let (vt_title, terminal_responses, rev_state, alt_switched, status) =
                                 if let Some(vt) = state.vts.get_mut(&pane_id) {
                                     // LENS-R-032/DEC-4: detect an alt-screen
                                     // switch by comparing the PRESENTED alt flag
@@ -114,10 +196,14 @@ async fn run_pane_pty_task(
                                         responses,
                                         Some(rev),
                                         alt_before != alt_after,
+                                        Some(vt.program_status_publication()),
                                     )
                                 } else {
-                                    (None, Vec::new(), None, false)
+                                    (None, Vec::new(), None, false, None)
                                 };
+                            if let (Some(status), Some(channel)) = (status, state.status.get(&pane_id)) {
+                                channel.publish(status);
+                            }
                             // LENS-R-003: publish in the same critical section as
                             // the grid mutation, once per Class-A batch.
                             if let Some(rev) = rev_state {
@@ -140,22 +226,13 @@ async fn run_pane_pty_task(
                             )
                         };
 
-                        let mut response_write_failed = false;
+                        // An unbounded write to a program that never reads
+                        // would stop this loop reading output or seeing a cancel.
                         for response in &terminal_responses {
-                            if let Err(e) = handle.write(response).await {
-                                tracing::error!(%pane_id, error = %e, "PTY terminal response write error");
-                                response_write_failed = true;
-                                break;
+                            if !pending.push(response) {
+                                tracing::warn!(%pane_id, "program is not reading its terminal replies; dropping one");
                             }
                         }
-                        if response_write_failed {
-                            break;
-                        }
-                        if !terminal_responses.is_empty()
-                            && let Err(e) = handle.flush().await {
-                                tracing::error!(%pane_id, error = %e, "PTY terminal response flush error");
-                                break;
-                            }
 
                         // Stage these bytes for the next sampled publish.
                         // We cap the buffered chunk at 64KB to avoid
@@ -223,6 +300,9 @@ async fn run_pane_pty_task(
                         if vt_title != last_osc_title {
                             if let Some(t) = vt_title.clone()
                                 && !t.is_empty()
+                                // Re-checked: a replacement during this read
+                                // must not leave the old program's title.
+                                && io_state.lock().await.is_current(pane_id, incarnation)
                                     && let Err(e) =
                                         graph.set_pane_osc_title(pane_id, t).await
                                     {
@@ -241,24 +321,30 @@ async fn run_pane_pty_task(
                     }
                 }
             }
-            res = write_rx.recv() => {
-                let data = match res {
-                    Some(d) => d,
-                    None => {
-                        // Sender dropped -- the pane was destroyed.
-                        // Exit so we can kill() the child shell.
-                        tracing::debug!(%pane_id, "writer channel closed");
-                        task_exit = PtyTaskExit::RequestedTeardown;
+            // Bounded: past the cap, senders wait instead of input being lost.
+            res = write_rx.recv(), if pending.takes_input() => {
+                let Some(data) = res else {
+                    // Sender dropped -- the pane was destroyed.
+                    // Exit so we can kill() the child shell.
+                    tracing::debug!(%pane_id, "writer channel closed");
+                    task_exit = PtyTaskExit::RequestedTeardown;
+                    break;
+                };
+                pending.push_input(data);
+            }
+            // Waits for room, never blocks the loop: a program that stops
+            // reading cannot stop this loop reading output or seeing a cancel.
+            res = input.write_some(pending.next()), if !pending.is_empty() => {
+                match res {
+                    Ok(0) => {
+                        tracing::error!(%pane_id, "PTY write took nothing");
                         break;
                     }
-                };
-                if let Err(e) = handle.write(&data).await {
-                    tracing::error!(%pane_id, error = %e, "PTY write error");
-                    break;
-                }
-                if let Err(e) = handle.flush().await {
-                    tracing::error!(%pane_id, error = %e, "PTY flush error");
-                    break;
+                    Ok(n) => pending.consume(n),
+                    Err(e) => {
+                        tracing::error!(%pane_id, error = %e, "PTY write error");
+                        break;
+                    }
                 }
             }
             res = resize_rx.recv() => {
@@ -275,7 +361,10 @@ async fn run_pane_pty_task(
                 }
                 let (pulse, dims_changed) = {
                     let mut state = io_state.lock().await;
-                    let rev_state = if let Some(vt) = state.vts.get_mut(&pane_id) {
+                    let current = state.is_current(pane_id, incarnation);
+                    let rev_state = if !current {
+                        None
+                    } else if let Some(vt) = state.vts.get_mut(&pane_id) {
                         // P4 convergence round 1 (claude blocker): gate the
                         // invalidation on an ACTUAL dimension change, exactly
                         // like the process branch gates on alt_switched. The
@@ -333,6 +422,7 @@ async fn run_pane_pty_task(
                     tee_pane_resize_recorders(
                         &io_state,
                         pane_id,
+                        Some(incarnation),
                         req.size.cols,
                         req.size.rows,
                     )
@@ -342,7 +432,7 @@ async fn run_pane_pty_task(
         }
     }
 
-    finish_pane_recorders(&io_state, pane_id).await;
+    finish_pane_recorders(&io_state, pane_id, Some(incarnation)).await;
 
     // Reap the child cleanly so plugins and `events.history` see the
     // real exit code on `pane.exited`. The loop exits for several
@@ -405,8 +495,36 @@ async fn run_pane_pty_task(
     // event would let the runner compare the crash frame instead of short-circuiting.
     // The reaper and `--wait` also key on this event, so a signalled child is now reaped
     // promptly rather than lingering to `max-runtime`.
+    // The graph applies this only if `incarnation` still owns the pane.
     let exit_status = exit_code.unwrap_or(-1);
-    if let Err(e) = graph.set_pane_exit_status(pane_id, exit_status).await {
+    // The process is gone: end its live records and send the final status
+    // with the exit, so status_changed precedes exited. One lock hold decides
+    // ownership and reads the terminal; a successor's records are not ours.
+    let final_status = {
+        let mut guard = io_state.lock().await;
+        let state = &mut *guard;
+        match state.vts.get_mut(&pane_id) {
+            Some(vt) if state.incarnations.get(&pane_id) == Some(&incarnation) => {
+                // Sealed in this lock hold: the config walker leaves the pane
+                // alone, so nothing can overtake the final status. The writer
+                // stays until the exit commits, or attach would read the pane
+                // as never spawned and run its command again.
+                state.status_sealed.insert(pane_id);
+                vt.note_process_exit();
+                let publication = vt.program_status_publication();
+                let update = crate::program_status::update(&publication);
+                if let Some(channel) = state.status.get(&pane_id) {
+                    channel.publish(publication);
+                }
+                Some(update)
+            }
+            _ => None,
+        }
+    };
+    if let Err(e) = graph
+        .set_pane_exit_status_owned(pane_id, exit_status, incarnation, final_status)
+        .await
+    {
         tracing::debug!(%pane_id, error = %e, "set_pane_exit_status failed (pane may already be gone)");
     }
 
@@ -417,10 +535,12 @@ async fn run_pane_pty_task(
     // short-lived command. The Pane's exit_status is the "dead" flag;
     // tmux does the same with its `remain-on-exit` model.
     let mut state = io_state.lock().await;
-    state.writers.remove(&pane_id);
-    state.resizers.remove(&pane_id);
-    state.shutdowns.remove(&pane_id);
-    state.pty_done.remove(&pane_id);
+    if state.is_current(pane_id, incarnation) {
+        state.writers.remove(&pane_id);
+        state.resizers.remove(&pane_id);
+        state.shutdowns.remove(&pane_id);
+        state.pty_done.remove(&pane_id);
+    }
     let pulse = state.render_pulse.clone();
     drop(state);
     pulse.notify_one();
@@ -566,6 +686,105 @@ pub(crate) async fn spawn_pane_pty_with_recorder(
     graph: shux_core::graph::GraphHandle,
     cast_recorder: Option<PaneRecorder>,
 ) -> Result<(), shux_pty::PtyError> {
+    // One spawn per pane, decided before anything forks. A second spawn
+    // waits for one in flight and reports its outcome, or finds the pane
+    // already ran and leaves it.
+    let ticket = {
+        let mut in_flight = spawning();
+        match in_flight.get(&pane_id) {
+            Some(first) => Err(first.clone()),
+            None => {
+                let (tx, rx) = tokio::sync::watch::channel(None);
+                in_flight.insert(pane_id, rx);
+                Ok(SpawnTicket {
+                    pane_id,
+                    tx,
+                    ok: false,
+                })
+            }
+        }
+    };
+    let mut ticket = match ticket {
+        Ok(ticket) => ticket,
+        Err(mut first) => {
+            let ok = matches!(
+                first.wait_for(Option::is_some).await.as_deref(),
+                Ok(Some(true))
+            );
+            return if ok {
+                Ok(())
+            } else {
+                Err(pane_gone(
+                    pane_id,
+                    &"a concurrent spawn of this pane failed",
+                ))
+            };
+        }
+    };
+    // Under the ticket, so every earlier spawn has installed. An incarnation
+    // outlives the program's exit and goes only with the pane.
+    if io_state.lock().await.incarnations.contains_key(&pane_id) {
+        ticket.ok = true;
+        return Ok(());
+    }
+    let spawned = spawn_pane_pty_unshared(
+        pane_id,
+        cwd,
+        command,
+        size,
+        extra_env,
+        env_clear,
+        io_state.clone(),
+        shutdown,
+        graph,
+        cast_recorder,
+    )
+    .await;
+    ticket.ok = spawned.is_ok();
+    spawned
+}
+
+type SpawnOutcome = tokio::sync::watch::Receiver<Option<bool>>;
+
+/// Spawns in flight, by pane. Its own lock, never held across an await:
+/// spawns must not queue behind the io lock to learn they are redundant.
+fn spawning()
+-> std::sync::MutexGuard<'static, std::collections::HashMap<shux_core::model::PaneId, SpawnOutcome>>
+{
+    static SPAWNING: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<shux_core::model::PaneId, SpawnOutcome>>,
+    > = std::sync::LazyLock::new(Default::default);
+    SPAWNING.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The in-flight mark for one spawn. Released however the spawn ends —
+/// returned, cancelled or panicked — and publishes its outcome to waiters.
+struct SpawnTicket {
+    pane_id: shux_core::model::PaneId,
+    tx: tokio::sync::watch::Sender<Option<bool>>,
+    ok: bool,
+}
+
+impl Drop for SpawnTicket {
+    fn drop(&mut self) {
+        spawning().remove(&self.pane_id);
+        let _ = self.tx.send(Some(self.ok));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn spawn_pane_pty_unshared(
+    pane_id: shux_core::model::PaneId,
+    cwd: PathBuf,
+    command: Vec<String>,
+    size: shux_pty::handle::PtySize,
+    extra_env: Vec<(String, String)>,
+    env_clear: bool,
+    io_state: Arc<Mutex<PaneIoState>>,
+    shutdown: tokio_util::sync::CancellationToken,
+    graph: shux_core::graph::GraphHandle,
+    cast_recorder: Option<PaneRecorder>,
+) -> Result<(), shux_pty::PtyError> {
     let (argv, env) = resolve_pane_spawn(command, &daemon_shell_config(), extra_env, env_clear);
     let mut config = if argv.is_empty() {
         shux_pty::handle::PtyConfig::default_shell(cwd)
@@ -576,13 +795,14 @@ pub(crate) async fn spawn_pane_pty_with_recorder(
     config.env = env;
     config.env_clear = env_clear;
     let handle = shux_pty::handle::PtyHandle::spawn(&config)?;
+    let input = handle.input_writer()?;
     let pid = handle.pid();
 
     let (write_tx, write_rx) = mpsc::channel::<Vec<u8>>(256);
     let (resize_tx, resize_rx) = mpsc::channel::<ResizeRequest>(16);
     let (done_tx, done_rx) = oneshot::channel::<()>();
     let pane_shutdown = shutdown.child_token();
-    let vt = shux_vt::VirtualTerminal::new(size.rows as usize, size.cols as usize);
+    let mut vt = shux_vt::VirtualTerminal::new(size.rows as usize, size.cols as usize);
     // LENS-R-003: seed the per-pane revision watch with the VT's initial
     // (content_revision=1, last_mutation_ns=creation time). The initial
     // receiver is dropped; P3 subscribers call `subscribe()` on the stored
@@ -594,17 +814,76 @@ pub(crate) async fn spawn_pane_pty_with_recorder(
     };
     let (rev_tx, _rev_rx) = watch::channel(initial_rev);
 
+    static NEXT_INCARNATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let incarnation = NEXT_INCARNATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut status_flush = None;
+    // Before the claim: a claim clears an exited pane's exit and announces a
+    // respawn. The check under the io lock below still covers a shutdown that
+    // lands in between.
+    if shutdown.is_cancelled() {
+        discard_child(handle);
+        return Err(pane_gone(pane_id, &"the daemon is shutting down"));
+    }
+    match graph.claim_pane_pty(pane_id, incarnation).await {
+        Ok(true) => {}
+        // A newer spawn owns the pane; it is the one that runs there.
+        Ok(false) => {
+            discard_child(handle);
+            return Ok(());
+        }
+        Err(e) => {
+            discard_child(handle);
+            return Err(pane_gone(pane_id, &e));
+        }
+    }
     {
         let mut state = io_state.lock().await;
+        // Daemon shutdown cancels this token before it collects the panes to
+        // wait for, so an install after that would go unwaited.
+        if shutdown.is_cancelled() {
+            drop(state);
+            discard_child(handle);
+            return Err(pane_gone(pane_id, &"the daemon is shutting down"));
+        }
+        if state
+            .incarnations
+            .get(&pane_id)
+            .is_some_and(|&installed| installed > incarnation)
+        {
+            drop(state);
+            discard_child(handle);
+            return Ok(());
+        }
         if let Some(old) = state.shutdowns.insert(pane_id, pane_shutdown.clone()) {
             old.cancel();
         }
+        vt.set_program_status_enabled(state.program_status_enabled);
+        let status = vt.program_status_publication();
+        let status_generation = status.generation;
+        state.incarnations.insert(pane_id, incarnation);
         state.writers.insert(pane_id, write_tx);
         state.resizers.insert(pane_id, resize_tx);
         state.pty_done.insert(pane_id, done_rx);
-        state.vts.insert(pane_id, vt);
+        let replaced = state.vts.insert(pane_id, vt).is_some();
+        state.status_sealed.remove(&pane_id);
         state.revisions.insert(pane_id, rev_tx);
         state.pty_pids.insert(pane_id, pid);
+        // The slot outlives a respawn: the new terminal's newer generation
+        // clears what the old program reported.
+        match state.status.get(&pane_id) {
+            Some(channel) => channel.publish(status),
+            None => {
+                let channel =
+                    crate::program_status::StatusChannel::start(pane_id, status, graph.clone());
+                state.status.insert(pane_id, channel);
+            }
+        }
+        if replaced {
+            status_flush = state
+                .status
+                .get(&pane_id)
+                .map(|c| (c.flusher(), status_generation));
+        }
         // Arm the cast recorder in the SAME lock, before the read task spawns, so no output can
         // race ahead of it (task 083).
         if let Some(rec) = cast_recorder {
@@ -612,20 +891,55 @@ pub(crate) async fn spawn_pane_pty_with_recorder(
         }
     }
 
+    // Best-effort: consumers see the old program's status cleared before the
+    // new one can report.
+    if let Some((flusher, generation)) = status_flush {
+        flusher.flush(generation).await;
+    }
     tokio::spawn(run_pane_pty_task(
         pane_id,
         handle,
-        io_state,
+        io_state.clone(),
         PtyTaskControl {
+            incarnation,
             write_rx,
             resize_rx,
             shutdown: pane_shutdown,
             done_tx,
+            input,
         },
-        graph,
+        graph.clone(),
     ));
 
+    // Destruction commits to the graph before it tears down IO: either the
+    // pane is still here, or that teardown ran before the install above.
+    if !graph.snapshot().panes.contains_key(&pane_id) {
+        let mut state = io_state.lock().await;
+        if state.is_current(pane_id, incarnation) {
+            let (pulse, _done) = state.teardown_panes_collecting(&[pane_id], true);
+            drop(state);
+            pulse.notify_waiters();
+        }
+        return Err(pane_gone(
+            pane_id,
+            &"it was destroyed while its PTY started",
+        ));
+    }
     Ok(())
+}
+
+/// Kill and reap the child of a spawn that will not be installed.
+fn discard_child(mut handle: shux_pty::handle::PtyHandle) {
+    let _ = handle.kill();
+    tokio::spawn(async move {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle.wait()).await;
+    });
+}
+
+fn pane_gone(pane_id: shux_core::model::PaneId, why: &dyn std::fmt::Display) -> shux_pty::PtyError {
+    shux_pty::PtyError::Spawn(std::io::Error::other(format!(
+        "pane {pane_id} cannot take a PTY: {why}"
+    )))
 }
 
 /// Turn a PTY spawn failure into an error whose hint matches the actual cause.
@@ -850,5 +1164,392 @@ mod tests {
         let shell = daemon_shell_config();
         assert!(shell.command.is_empty());
         assert!(shell.env.is_empty());
+    }
+
+    /// A pane whose PTY is installed again while its first task still runs
+    /// must end up owned by the second task. The first, cancelled, must
+    /// neither mark the pane exited nor tear down its successor's handles.
+    /// (`spawn_pane_pty` leaves a started pane alone; this drives the install.)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_replaced_pty_task_leaves_its_successor_alone() {
+        let h = crate::rpc::test_harness::RpcHarness::new();
+        let (_s, _w, pane) = h.seed_session("respawn").await;
+        let spawn = || {
+            spawn_pane_pty_unshared(
+                pane,
+                "/tmp".into(),
+                vec!["sleep".into(), "30".into()],
+                shux_pty::handle::PtySize::default(),
+                Vec::new(),
+                false,
+                h.io.clone(),
+                h.cancel.clone(),
+                h.graph.clone(),
+                None,
+            )
+        };
+        spawn().await.unwrap();
+        let first_done = h.io.lock().await.pty_done.remove(&pane).unwrap();
+        spawn().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), first_done)
+            .await
+            .expect("the replaced task finishes")
+            .ok();
+
+        assert_eq!(
+            h.graph.snapshot().panes[&pane].exit_status,
+            None,
+            "the successor is still running"
+        );
+        let state = h.io.lock().await;
+        assert!(
+            state.writers.contains_key(&pane),
+            "successor writer removed"
+        );
+        assert!(
+            state.shutdowns.contains_key(&pane),
+            "successor shutdown removed"
+        );
+        drop(state);
+        h.stop().await;
+    }
+
+    /// A recorder the successor armed at spawn belongs to the successor; the
+    /// replaced task's exit must not finish it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_replaced_pty_task_does_not_finish_its_successors_recorder() {
+        let h = crate::rpc::test_harness::RpcHarness::new();
+        let (_s, _w, pane) = h.seed_session("respawn-rec").await;
+        let dir = tempfile::tempdir().unwrap();
+        let spawn = |rec| {
+            spawn_pane_pty_unshared(
+                pane,
+                "/tmp".into(),
+                vec!["sleep".into(), "30".into()],
+                shux_pty::handle::PtySize::default(),
+                Vec::new(),
+                false,
+                h.io.clone(),
+                h.cancel.clone(),
+                h.graph.clone(),
+                rec,
+            )
+        };
+        spawn(None).await.unwrap();
+        let first_done = h.io.lock().await.pty_done.remove(&pane).unwrap();
+        let rec = crate::pane_record::open_cast_recorder(dir.path().join("s.cast"), 80, 24)
+            .await
+            .unwrap();
+        let outcome = rec.outcome.clone();
+        spawn(Some(rec)).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), first_done)
+            .await
+            .expect("the replaced task finishes")
+            .ok();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            outcome.lock().unwrap().status,
+            crate::pane_record::PaneRecordStatus::Recording,
+            "the successor's recording was finished by its predecessor"
+        );
+        h.stop().await;
+    }
+
+    /// A pane killed while recording has no successor: its recording must
+    /// finish, or a recorder without a duration waits forever.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_replaced_pty_task_torn_down_with_its_pane_finishes_its_recorder() {
+        let h = crate::rpc::test_harness::RpcHarness::new();
+        let (_s, _w, pane) = h.seed_session("kill-rec").await;
+        let dir = tempfile::tempdir().unwrap();
+        let rec = crate::pane_record::open_cast_recorder(dir.path().join("k.cast"), 80, 24)
+            .await
+            .unwrap();
+        let outcome = rec.outcome.clone();
+        spawn_pane_pty_with_recorder(
+            pane,
+            "/tmp".into(),
+            vec!["sleep".into(), "30".into()],
+            shux_pty::handle::PtySize::default(),
+            Vec::new(),
+            false,
+            h.io.clone(),
+            h.cancel.clone(),
+            h.graph.clone(),
+            Some(rec),
+        )
+        .await
+        .unwrap();
+        // What pane.kill does: tear the pane down, VT and all.
+        let (_pulse, done) = h.io.lock().await.teardown_panes_collecting(&[pane], true);
+        for rx in done {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), rx).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            outcome.lock().unwrap().status,
+            crate::pane_record::PaneRecordStatus::Complete,
+            "a recording on a killed pane was never finished"
+        );
+        h.stop().await;
+    }
+
+    /// What a program taking at most `limit` bytes per write receives.
+    fn write(q: &mut PtyInputQueue, limit: usize) -> Vec<u8> {
+        let mut sent = Vec::new();
+        while !q.is_empty() && sent.len() < limit {
+            let next = q.next();
+            let n = next.len().min(limit - sent.len());
+            sent.extend_from_slice(&next[..n]);
+            q.consume(n);
+        }
+        sent
+    }
+
+    #[test]
+    fn a_reply_the_program_only_partly_took_finishes_before_anything_else() {
+        let mut q = PtyInputQueue::default();
+        assert!(q.push(b"\x1b[?1;2c"));
+        assert!(q.push(b"\x1b[0n"));
+        let mut sent = write(&mut q, 4);
+        assert_eq!(sent, b"\x1b[?1");
+        sent.extend(write(&mut q, usize::MAX));
+        assert_eq!(
+            sent, b"\x1b[?1;2c\x1b[0n",
+            "the tail went first, nothing was lost"
+        );
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn a_reply_waits_for_the_input_chunk_being_written() {
+        let mut q = PtyInputQueue::default();
+        q.push_input(b"hello".to_vec());
+        q.push_input(b"world".to_vec());
+        let mut sent = write(&mut q, 2);
+        assert!(q.push(b"\x1b[0n"));
+        sent.extend(write(&mut q, usize::MAX));
+        assert_eq!(sent, b"hello\x1b[0nworld", "a reply landed inside a chunk");
+    }
+
+    #[test]
+    fn input_is_never_dropped_only_held_back_past_the_cap() {
+        let mut q = PtyInputQueue::default();
+        q.push_input(vec![b'p'; PtyInputQueue::INPUT_CAP + 10]);
+        assert!(!q.takes_input(), "input piled up past the cap");
+        let sent = write(&mut q, 20);
+        assert!(q.takes_input(), "room freed by the program reading");
+        let rest = write(&mut q, usize::MAX);
+        assert_eq!(sent.len() + rest.len(), PtyInputQueue::INPUT_CAP + 10);
+    }
+
+    #[test]
+    fn a_reply_that_does_not_fit_is_dropped_whole() {
+        let mut q = PtyInputQueue::default();
+        let reply = vec![b'x'; 1000];
+        let mut accepted = 0;
+        while q.push(&reply) {
+            accepted += 1;
+        }
+        assert_eq!(accepted, PtyInputQueue::CAP / reply.len());
+        assert_eq!(
+            q.replies.len(),
+            accepted * reply.len(),
+            "no partial reply queued"
+        );
+    }
+
+    /// A pane id plus the pid file its shell writes, so a test can prove the
+    /// child of a refused spawn did not survive.
+    fn pid_probe(dir: &std::path::Path) -> (std::path::PathBuf, Vec<String>) {
+        let pid_file = dir.join("pid");
+        let cmd = format!("echo $$ > '{}'; exec sleep 30", pid_file.display());
+        (pid_file, vec!["sh".into(), "-c".into(), cmd])
+    }
+
+    /// The child either never got far enough to write its pid, or is reaped.
+    async fn assert_child_gone(pid_file: &std::path::Path) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let alive = std::fs::read_to_string(pid_file)
+                .ok()
+                .and_then(|s| s.trim().parse::<i32>().ok())
+                .is_some_and(|pid| {
+                    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+                });
+            if !alive && (pid_file.exists() || tokio::time::Instant::now() >= deadline) {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the refused spawn's child is still running"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    async fn spawn_probe(
+        h: &crate::rpc::test_harness::RpcHarness,
+        pane: shux_core::model::PaneId,
+        argv: Vec<String>,
+    ) -> Result<(), shux_pty::PtyError> {
+        spawn_pane_pty(
+            pane,
+            "/tmp".into(),
+            argv,
+            shux_pty::handle::PtySize::default(),
+            Vec::new(),
+            false,
+            h.io.clone(),
+            h.cancel.clone(),
+            h.graph.clone(),
+        )
+        .await
+    }
+
+    /// A newer spawn already claimed the pane: the older one must not take
+    /// it back, install its handles, or leave its child running.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_replaced_pty_task_that_lost_the_claim_installs_nothing() {
+        let h = crate::rpc::test_harness::RpcHarness::new();
+        let (_s, _w, pane) = h.seed_session("lost-claim").await;
+        let dir = tempfile::tempdir().unwrap();
+        let (pid_file, argv) = pid_probe(dir.path());
+        let _ = h.graph.claim_pane_pty(pane, u64::MAX).await;
+        spawn_probe(&h, pane, argv).await.unwrap();
+        assert!(
+            !h.io.lock().await.writers.contains_key(&pane),
+            "a spawn older than the pane's owner installed its PTY"
+        );
+        assert_child_gone(&pid_file).await;
+        h.stop().await;
+    }
+
+    /// Claims and installs are separate steps, so a newer spawn can install
+    /// first. The older one must then leave the pane to it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_replaced_pty_task_older_than_the_installed_one_installs_nothing() {
+        let h = crate::rpc::test_harness::RpcHarness::new();
+        let (_s, _w, pane) = h.seed_session("lost-install").await;
+        let dir = tempfile::tempdir().unwrap();
+        let (pid_file, argv) = pid_probe(dir.path());
+        h.io.lock().await.incarnations.insert(pane, u64::MAX);
+        spawn_probe(&h, pane, argv).await.unwrap();
+        let state = h.io.lock().await;
+        assert_eq!(state.incarnations.get(&pane), Some(&u64::MAX));
+        assert!(
+            !state.writers.contains_key(&pane),
+            "an older spawn replaced the newer installed PTY"
+        );
+        drop(state);
+        assert_child_gone(&pid_file).await;
+        h.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_replaced_pty_task_for_a_missing_pane_fails() {
+        let h = crate::rpc::test_harness::RpcHarness::new();
+        let dir = tempfile::tempdir().unwrap();
+        let (pid_file, argv) = pid_probe(dir.path());
+        let ghost = shux_core::model::PaneId::new();
+        assert!(
+            spawn_probe(&h, ghost, argv).await.is_err(),
+            "a spawn for a pane that does not exist reported success"
+        );
+        assert!(!h.io.lock().await.writers.contains_key(&ghost));
+        assert_child_gone(&pid_file).await;
+        h.stop().await;
+    }
+
+    /// A spawn refused because the daemon is stopping must not claim the pane
+    /// first: a claim clears an exited pane's exit and announces a respawn
+    /// that never happens.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_replaced_pty_task_refused_at_shutdown_leaves_the_exit_alone() {
+        let h = crate::rpc::test_harness::RpcHarness::new();
+        let (_s, _w, pane) = h.seed_session("refused-at-shutdown").await;
+        let dir = tempfile::tempdir().unwrap();
+        let (pid_file, argv) = pid_probe(dir.path());
+        h.graph.set_pane_exit_status(pane, 0).await.unwrap();
+        let stopping = tokio_util::sync::CancellationToken::new();
+        stopping.cancel();
+        let spawned = spawn_pane_pty(
+            pane,
+            "/tmp".into(),
+            argv,
+            shux_pty::handle::PtySize::default(),
+            Vec::new(),
+            false,
+            h.io.clone(),
+            stopping,
+            h.graph.clone(),
+        )
+        .await;
+        assert!(spawned.is_err(), "a spawn during shutdown reported success");
+        assert_eq!(h.graph.snapshot().panes[&pane].exit_status, Some(0));
+        let respawned = h.bus.history(50).into_iter().any(|e| {
+            matches!(e.data, shux_core::event::EventData::PaneRespawned { pane_id, .. } if pane_id == pane)
+        });
+        assert!(!respawned, "announced a respawn that never happened");
+        assert_child_gone(&pid_file).await;
+        h.stop().await;
+    }
+
+    /// The pane is destroyed after the claim but before the install, and its
+    /// IO teardown has already run: the spawn must clean up after itself.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_replaced_pty_task_whose_pane_died_mid_spawn_cleans_up() {
+        let h = crate::rpc::test_harness::RpcHarness::new();
+        let (session, _w, pane) = h.seed_session("died-mid-spawn").await;
+        let dir = tempfile::tempdir().unwrap();
+        let (pid_file, argv) = pid_probe(dir.path());
+        // An exited pane makes the claim observable: it clears the exit.
+        h.graph.set_pane_exit_status(pane, 0).await.unwrap();
+        let guard = h.io.lock().await;
+        let task = {
+            let io = h.io.clone();
+            let cancel = h.cancel.clone();
+            let graph = h.graph.clone();
+            tokio::spawn(async move {
+                spawn_pane_pty_unshared(
+                    pane,
+                    "/tmp".into(),
+                    argv,
+                    shux_pty::handle::PtySize::default(),
+                    Vec::new(),
+                    false,
+                    io,
+                    cancel,
+                    graph,
+                    None,
+                )
+                .await
+            })
+        };
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while h.graph.snapshot().panes[&pane].exit_status.is_some() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "spawn never claimed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        h.graph.destroy_session(session, None).await.unwrap();
+        drop(guard);
+        let result = task.await.unwrap();
+        assert!(
+            result.is_err(),
+            "spawn for a destroyed pane reported success"
+        );
+        let state = h.io.lock().await;
+        assert!(
+            !state.writers.contains_key(&pane)
+                && !state.vts.contains_key(&pane)
+                && !state.incarnations.contains_key(&pane),
+            "a destroyed pane kept its PTY handles"
+        );
+        drop(state);
+        assert_child_gone(&pid_file).await;
+        h.stop().await;
     }
 }

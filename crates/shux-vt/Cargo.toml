@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+shux-program-status = { path = "../shux-program-status" }
 base64 = "0.22"
 vte = { workspace = true }
 memchr = { workspace = true }
@@ -22,3 +23,7 @@ proptest = "1"
 # this a library dependency; it is the gate's now (#151), and the library itself
 # hashes nothing — `frame_stability_hash` uses a `DefaultHasher`.
 sha2 = { workspace = true }
+
+[lints.rust]
+# `fuzzing` is set by cargo-fuzz for the targets in fuzz/.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }

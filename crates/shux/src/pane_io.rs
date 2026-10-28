@@ -76,6 +76,10 @@ pub struct PaneIoState {
     /// Per-pane completion receivers used by daemon shutdown to wait until
     /// PTY tasks have actually signalled and reaped their children.
     pub pty_done: HashMap<shux_core::model::PaneId, oneshot::Receiver<()>>,
+    /// Which PTY task currently owns each pane. A pane spawned again while
+    /// its previous task is still winding down belongs to the newer task; the
+    /// older one must not touch its VT, handles or exit status.
+    pub incarnations: HashMap<shux_core::model::PaneId, u64>,
     /// Completion waiters for PTY tasks that were already explicitly torn
     /// down by pane/window/session kill. Daemon shutdown drains these too so
     /// it cannot exit while an earlier teardown is still in its reap/escalate
@@ -121,6 +125,13 @@ pub struct PaneIoState {
     /// needing its own handle to the spawned `PtyHandle`. Same lifetime as
     /// `vts`: cleared on pane teardown.
     pub pty_pids: HashMap<shux_core::model::PaneId, u32>,
+    /// OSC 7501 status slot and publisher per pane. Same lifetime as `vts`.
+    pub(crate) status: HashMap<shux_core::model::PaneId, crate::program_status::StatusChannel>,
+    /// `[program_status] enabled`, applied to every VT under this lock.
+    pub(crate) program_status_enabled: bool,
+    /// Panes whose process exited: their final status is sent and no later
+    /// change (a config reload) may follow it. Cleared by the next spawn.
+    pub(crate) status_sealed: std::collections::HashSet<shux_core::model::PaneId>,
 }
 
 impl Default for PaneIoState {
@@ -136,6 +147,7 @@ impl PaneIoState {
             resizers: HashMap::new(),
             shutdowns: HashMap::new(),
             pty_done: HashMap::new(),
+            incarnations: HashMap::new(),
             teardown_waiters: Vec::new(),
             vts: HashMap::new(),
             revisions: HashMap::new(),
@@ -146,6 +158,9 @@ impl PaneIoState {
             event_bus: None,
             recorders: HashMap::new(),
             pty_pids: HashMap::new(),
+            status: HashMap::new(),
+            program_status_enabled: true,
+            status_sealed: Default::default(),
         }
     }
 
@@ -173,6 +188,11 @@ impl PaneIoState {
         }));
     }
 
+    /// Whether `incarnation` is still the PTY task that owns `pane_id`.
+    pub fn is_current(&self, pane_id: shux_core::model::PaneId, incarnation: u64) -> bool {
+        self.incarnations.get(&pane_id) == Some(&incarnation)
+    }
+
     pub fn teardown_panes_collecting(
         &mut self,
         pane_ids: &[shux_core::model::PaneId],
@@ -196,6 +216,11 @@ impl PaneIoState {
                 self.checkpoints.remove(pane_id);
                 self.invalidations.remove(pane_id);
                 self.pty_pids.remove(pane_id);
+                self.incarnations.remove(pane_id);
+                if let Some(channel) = self.status.remove(pane_id) {
+                    self.teardown_waiters.push(channel.stop());
+                }
+                self.status_sealed.remove(pane_id);
             }
         }
         (self.render_pulse.clone(), done)

@@ -518,6 +518,14 @@ pub(crate) async fn run_rpc_server(
     // Publish before the RPC server accepts connections, so the very first
     // pane spawn already sees `[shell]` (issue #132).
     publish_daemon_config(config_handle.clone());
+    // Before any server accepts: a pane spawned before the walker's first
+    // pass must already follow the config.
+    io_state.lock().await.program_status_enabled = config_handle.current().program_status.enabled;
+    tokio::spawn(crate::program_status::run_config_walker(
+        config_handle.clone(),
+        io_state.clone(),
+        cancel.clone(),
+    ));
     let cfg_watcher_handle = config_handle.clone();
     let cfg_watcher_path = config_path.clone();
     let cfg_watcher_cancel = cancel.clone();
@@ -765,15 +773,19 @@ pub(crate) async fn shutdown_all_pane_io(io_state: Arc<Mutex<PaneIoState>>) {
             .chain(state.writers.keys())
             .chain(state.resizers.keys())
             .chain(state.pty_done.keys())
+            // An exited pane keeps its VT and status publisher; stop those too.
+            .chain(state.vts.keys())
+            .chain(state.status.keys())
             .copied()
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
             .collect();
+        // After teardown: it queues the status publishers' joins.
+        let (pulse, done) = state.teardown_panes_collecting(&pane_ids, true);
         state
             .teardown_waiters
             .retain(|waiter| !waiter.is_finished());
         let teardown_waiters = std::mem::take(&mut state.teardown_waiters);
-        let (pulse, done) = state.teardown_panes_collecting(&pane_ids, true);
         drop(state);
         pulse.notify_waiters();
         (done, teardown_waiters)

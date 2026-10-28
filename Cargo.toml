@@ -9,13 +9,14 @@ members = [
     "crates/shux-plugin",
     "crates/shux-ui",
     "crates/shux-raster",
+    "crates/shux-program-status",
 ]
 # lens T-tier seeded-bug demo app is a standalone crate (its own Cargo.toml
 # carries an empty [workspace]); excluded so the shux workspace never builds it.
 exclude = [".shux/fixtures/lens/t/demo-app"]
 
 [workspace.package]
-version = "0.51.0"
+version = "0.52.0"
 edition = "2024"
 rust-version = "1.93"
 license = "MIT"
@@ -81,6 +82,11 @@ sha2 = "0.11"
 # ── Build profiles ────────────────────────────────────────────────────────
 [profile.dev]
 debug = "line-tables-only"
+# macOS defaults to "unpacked", which keeps every codegen unit's .o in
+# target/*/deps and never prunes stale ones: ~25 per crate per rebuild, until
+# the directory holds ~900k files and every build, list and exec crawls.
+# "packed" keeps the backtrace line tables in a .dSYM and leaves no .o behind.
+split-debuginfo = "packed"
 
 [profile.dev.package."*"]
 opt-level = 2

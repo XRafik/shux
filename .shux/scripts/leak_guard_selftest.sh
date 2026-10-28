@@ -68,8 +68,22 @@ selftest_runtime="$(mktemp -d "${TMPDIR:-/tmp}/shux-leak-guard-selftest.XXXXXX")
 # exactly the failure paths the trap exists for, and every run leaked its temp dirs even
 # when green. Each assert runs in a subshell (it kills what it reports either way, and
 # keeps no state), so a failure is recorded instead of fatal and cleanup always runs.
+# Everything a wedge case below creates, on every exit path: the stopped daemon,
+# its pane tree's process groups, the subreaper, the bystander's session and the
+# runtime dir. The case clears each variable once it has cleaned that part up.
+cleanup_wedge() {
+  local pid
+  [ -z "${wedge_pid:-}" ] || kill -KILL "${wedge_pid}" >/dev/null 2>&1 || true
+  for pid in ${wedge_tree:-}; do
+    kill -KILL -- "-${pid}" >/dev/null 2>&1 || kill -KILL "${pid}" >/dev/null 2>&1 || true
+  done
+  [ -z "${holder:-}" ] || kill -KILL "${holder}" >/dev/null 2>&1 || true
+  [ -z "${bystander_pid:-}" ] || kill -KILL -- "-${bystander_pid}" >/dev/null 2>&1 || true
+  rm -rf "${wedge_runtime}"
+}
 on_exit() {
   local rc=0
+  [ -z "${wedge_runtime:-}" ] || cleanup_wedge
   [ -z "${baseline_runtime:-}" ] || stop_baseline_daemon
   [ -z "${foreign_root:-}" ] || stop_foreign_daemon
   (assert_leaked_daemon_reaped "${selftest_runtime}") || rc=1
@@ -175,20 +189,25 @@ assert_no_new_orphan_automation_processes "${orphan_baseline}"
 # tty matched neither branch of `orphan_candidate_pids`, so the guard reported
 # success while the server ran on, holding its display number for good.
 #
-# The leak is a COPY of `sleep` named `Xvfb`, not a real X server. `ps -o comm=`
-# reports the executable's basename, which is the whole of what the guard matches
-# on, so the copy exercises the real matching path — and this case then runs on a
-# machine with no X server installed, which is most of them.
+# The leak is `sleep` exec'd through a SYMLINK named `Xvfb`, not a real X server.
+# `ps -o comm=` reports the exec'd path's basename, which is the whole of what the
+# guard matches on, so the link exercises the real matching path — and this case
+# then runs on a machine with no X server installed, which is most of them. Not a
+# copy: macOS SIGKILLs a copied Apple platform binary at exec, so a copied
+# `sleep` died at once, left nothing behind, and this case failed on every Mac.
 xvfb_shim_dir="$(mktemp -d "${TMPDIR:-/tmp}/shux-leak-guard-xvfb.XXXXXX")"
-cp "$(command -v sleep)" "${xvfb_shim_dir}/Xvfb"
+ln -s "$(command -v sleep)" "${xvfb_shim_dir}/Xvfb"
 
+# The fixture records the pid it orphaned, and the guard has to NAME it: a
+# fixture that failed to launch also makes the guard exit non-zero, and that
+# is not detection.
 set +e
-.shux/scripts/no_leak_guard.sh python3 - "${xvfb_shim_dir}/Xvfb" <<'XVFBLEAK'
+xvfb_guard_err="$(.shux/scripts/no_leak_guard.sh python3 - "${xvfb_shim_dir}/Xvfb" "${xvfb_shim_dir}/pid" 2>&1 >/dev/null <<'XVFBLEAK'
 import subprocess
 import sys
 import time
 
-subprocess.Popen(
+p = subprocess.Popen(
     [sys.argv[1], "60"],
     stdin=subprocess.DEVNULL,
     stdout=subprocess.DEVNULL,
@@ -196,15 +215,29 @@ subprocess.Popen(
     start_new_session=True,
     close_fds=True,
 )
+with open(sys.argv[2], "w") as f:
+    f.write(str(p.pid))
 time.sleep(0.25)
 sys.exit(0)
 XVFBLEAK
+)"
 xvfb_guard_status=$?
 set -e
+xvfb_pid="$(cat "${xvfb_shim_dir}/pid" 2>/dev/null || true)"
 rm -rf "${xvfb_shim_dir}"
+if [ -n "${xvfb_pid}" ]; then
+  kill -KILL -- "-${xvfb_pid}" >/dev/null 2>&1 || true
+fi
 
-if [ "${xvfb_guard_status}" -eq 0 ]; then
-  echo "no_leak_guard did not fail for an intentionally orphaned X server" >&2
+if [ -z "${xvfb_pid}" ]; then
+  echo "the orphaned-X-server fixture never started (guard status ${xvfb_guard_status}):" >&2
+  echo "${xvfb_guard_err}" >&2
+  exit 1
+fi
+if [ "${xvfb_guard_status}" -eq 0 ] \
+  || ! grep -Eq "orphan automation process\(es\):(.* )?${xvfb_pid}( |$)" <<<"${xvfb_guard_err}"; then
+  echo "no_leak_guard did not report the orphaned X server ${xvfb_pid} (status ${xvfb_guard_status}):" >&2
+  echo "${xvfb_guard_err}" >&2
   exit 1
 fi
 
@@ -368,8 +401,8 @@ tree_pids() {
 # With `forking`, the pane keeps forking children that ignore HUP and TERM, so some are
 # born after the reaper's first walk of the tree.
 reap_wedged_daemon() {
-  local mode="$1" wedge_runtime wedge_pid wedge_tree bystander_needle bystander_pidfile
-  local bystander_pid wedge_reap_status bystander_alive pid holder="" ready
+  local mode="$1" wedge_runtime wedge_pid wedge_tree="" bystander_needle
+  local bystander_pid="" wedge_reap_status bystander_alive pid holder="" ready
   wedge_runtime="$(mktemp -d "${TMPDIR:-/tmp}/shux-leak-guard-wedge.XXXXXX")"
   wedge_pid=""
   # Every early exit goes through here, so a failed setup leaks nothing.
@@ -380,6 +413,7 @@ reap_wedged_daemon() {
       kill -KILL "${victim}" >/dev/null 2>&1 || true
     done
     [ -z "${holder}" ] || wait "${holder}" 2>/dev/null || true
+    wedge_pid="" holder=""
     rm -rf "${wedge_runtime}"
     exit 1
   }
@@ -435,16 +469,29 @@ time.sleep(600)
   # A process this checkout orphans DURING the reap window, owned by nobody the reap
   # touched. Attribution by "appeared between two snapshots" killed it.
   #
-  # It reports its own pid: `setsid` forks, so `$!` is a process that has already exited,
-  # and killing that one leaves the real bystander — and its `sleep` — running. Cleanup
-  # signals the whole session `setsid` made, so nothing outlives this block.
-  bystander_pidfile="$(mktemp "${TMPDIR:-/tmp}/shux-leak-guard-bystander.XXXXXX")"
-  # Detached in a subshell so bash does not report our own deliberate kill as a job.
-  (setsid sh -c "echo \$\$ >'${bystander_pidfile}'; sleep 300; : ${bystander_needle}" \
-    >/dev/null 2>&1 &)
-  sleep 0.5
-  bystander_pid="$(cat "${bystander_pidfile}")"
-  rm -f "${bystander_pidfile}"
+  # A new session leader, orphaned as soon as its launcher exits. python3 rather than
+  # `setsid(1)`, which macOS does not ship — there the bystander was never created and
+  # this case failed with an empty pid. Cleanup signals the whole session, so nothing
+  # outlives this block.
+  bystander_pid="$(python3 - "${bystander_needle}" <<'BYSTANDER'
+import subprocess
+import sys
+
+p = subprocess.Popen(
+    ["sh", "-c", "sleep 300; : " + sys.argv[1]],
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+    start_new_session=True,
+    close_fds=True,
+)
+print(p.pid)
+BYSTANDER
+)"
+  if [ -z "${bystander_pid}" ] || pid_is_gone "${bystander_pid}"; then
+    echo "could not start the bystander process this case needs" >&2
+    exit 1
+  fi
 
   set +e
   .shux/scripts/reap_daemons.sh >/dev/null
@@ -453,6 +500,8 @@ time.sleep(600)
   bystander_alive=1
   pid_is_gone "${bystander_pid}" && bystander_alive=0
   kill -KILL -- "-${bystander_pid}" >/dev/null 2>&1 || true
+  bystander_pid=""
+  pid_is_gone "${wedge_pid}" && wedge_pid=""
   # Checked before the subreaper exits, which would hand its orphans to init.
   local survivors=""
   for pid in ${wedge_tree}; do
@@ -474,6 +523,7 @@ time.sleep(600)
     wait "${holder}" 2>/dev/null || true
   fi
   rm -rf "${wedge_runtime}"
+  wedge_tree="" holder="" wedge_runtime=""
   [ -z "${survivors}" ] || exit 1
 
   if [ "${wedge_reap_status}" -ne 0 ]; then
@@ -481,7 +531,7 @@ time.sleep(600)
     exit 1
   fi
   if [ "${bystander_alive}" -ne 1 ]; then
-    echo "reap_daemons.sh killed a process it did not strand (${bystander_pid})" >&2
+    echo "reap_daemons.sh killed a process it did not strand" >&2
     exit 1
   fi
 }
