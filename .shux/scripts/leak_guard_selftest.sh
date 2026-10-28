@@ -399,7 +399,9 @@ tree_pids() {
 # `subreaper`, the daemon is started below a child subreaper, as under `systemd --user`
 # on a desktop: its orphans are adopted by that, not by init, and nothing reaps them.
 # With `forking`, the pane keeps forking children that ignore HUP and TERM, so some are
-# born after the reaper's first walk of the tree.
+# born after the reaper's first walk of the tree. With `handoff`, a pane process waits
+# for the daemon to die, then forks a child and exits: the child's parent is gone and
+# no lineage leads back to the daemon unless the tree was frozen before the kill.
 reap_wedged_daemon() {
   local mode="$1" wedge_runtime wedge_pid wedge_tree="" bystander_needle
   local bystander_pid="" wedge_reap_status bystander_alive pid holder="" ready
@@ -423,6 +425,15 @@ reap_wedged_daemon() {
   local fork_needle="7$$"
   [ "${mode}" != forking ] ||
     pane="trap '' HUP TERM; while :; do sleep ${fork_needle} & sleep 0.05; done"
+  if [ "${mode}" = handoff ]; then
+    # `read` is a builtin, so the daemon's death is seen before a reaper's next step.
+    cat >"${wedge_runtime}/handoff.sh" <<HANDOFF
+trap '' HUP TERM
+while read -r _ _ state _ </proc/\$1/stat 2>/dev/null && [ "\${state}" != Z ]; do sleep 0.01; done
+sleep ${fork_needle} &
+HANDOFF
+    pane="trap '' HUP TERM; sh '${wedge_runtime}/handoff.sh' \$PPID & exec sleep 400"
+  fi
   set -- env -u SHUX_SOCKET XDG_RUNTIME_DIR="${wedge_runtime}" "${shux_bin}" --format json \
     session create leak-guard-wedge-$$ -d -- sh -c "${pane}"
   if [ "${mode}" = subreaper ]; then
@@ -507,7 +518,7 @@ BYSTANDER
   for pid in ${wedge_tree}; do
     pid_is_gone "${pid}" || survivors="${survivors} ${pid}"
   done
-  if [ "${mode}" = forking ]; then
+  if [ "${mode}" = forking ] || [ "${mode}" = handoff ]; then
     # shellcheck disable=SC2009  # ps|grep is required by the process-hygiene rule
     for pid in $(ps -axo pid=,args= | grep -E "^ *[0-9]+ sleep ${fork_needle}\$" | awk '{ print $1 }'); do
       case " ${survivors} " in *" ${pid} "*) ;; *) pid_is_gone "${pid}" || survivors="${survivors} ${pid}" ;; esac
@@ -542,9 +553,10 @@ BYSTANDER
 if [ -z "$(shux_daemon_pids)" ]; then
   reap_wedged_daemon plain
   reap_wedged_daemon forking
-  # PR_SET_CHILD_SUBREAPER is Linux-only.
+  # PR_SET_CHILD_SUBREAPER is Linux-only, and `handoff` watches /proc.
   if [ "$(uname -s)" = "Linux" ]; then
     reap_wedged_daemon subreaper
+    reap_wedged_daemon handoff
   fi
 else
   echo "note: other daemons from this checkout are running; skipping the reap sweep case" >&2

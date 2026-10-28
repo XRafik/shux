@@ -28,25 +28,14 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 # shellcheck disable=SC2207  # mapfile is bash 4+; macOS ships bash 3.2
 pids=($(shux_daemon_pids))
 
-# Every descendant of a pid, listed while it is still the root of their tree. A pane's
-# shell forks too, and what it forks can ignore the SIGHUP that ends the shell.
-descendant_pids() {
-  ps -axo pid=,ppid= | awk -v root="$1" '
-    { parent[NR] = $2; pid[NR] = $1 }
-    END {
-      tree[root] = 1
-      do {
-        grew = 0
-        for (i = 1; i <= NR; i++) {
-          if ((parent[i] in tree) && !(pid[i] in tree)) { tree[pid[i]] = 1; print pid[i]; grew = 1 }
-        }
-      } while (grew)
-    }'
-}
-
 # When a pid started, which with the pid names one process: pids are reused.
 start_time() {
   ps -p "$1" -o lstart= 2>/dev/null | tr -s ' ' || true
+}
+
+# The live children of any pid in a space-padded set, not already in it.
+children_outside() {
+  ps -axo pid=,ppid= | awk -v set="$1" 'index(set, " " $2 " ") && !index(set, " " $1 " ") { print $1 }'
 }
 
 if [ "${#pids[@]}" -eq 0 ]; then
@@ -58,20 +47,45 @@ for pid in "${pids[@]}"; do
   describe_pid "${pid}"
 done
 
-# Recorded before anything is signalled: SIGKILL destroys the only evidence of who owned
-# these. Once the daemon is gone its panes are orphans, adopted by init or by whatever
-# subreaper is nearest, with nothing connecting them to it. See the sweep below.
-descendants=()
-for pid in "${pids[@]}"; do
-  for child in $(descendant_pids "${pid}"); do
-    descendants+=("${child}=$(start_time "${child}")")
-  done
-done
-
 if [ "${dry_run}" -eq 1 ]; then
   echo "--dry-run: ${#pids[@]} daemon(s) would be stopped"
   exit 0
 fi
+
+# A daemon too wedged to service SIGTERM is SIGKILLed, and SIGKILL runs none of its pane
+# teardown: its pane children are reparented to init, holding the PTYs the daemon held.
+# Reaping without this turns one leaked daemon into several leaked shells and calls it
+# success — manufacturing precisely what `no_leak_guard.sh` exists to catch.
+#
+# So every descendant is frozen BEFORE any daemon is signalled, while the daemon is still
+# the root of their tree. Attribution is LINEAGE, not timing: anything else in this
+# checkout that orphans a process during the reap looks identical to a stranded pane, and
+# shux auto-starts a daemon on first use. Frozen, a process can neither fork a child past
+# the walk nor exit and hand its children to init; stopped parents keep their children's
+# ppid pointing at them, so the walk reaches a fixpoint. The daemons themselves keep
+# running, so a responsive one still shuts down gracefully.
+members=" ${pids[*]} "
+frozen=()
+frozen_at=()
+resume_frozen() {
+  local pid
+  for pid in "${frozen[@]:-}"; do
+    [ -n "${pid}" ] && kill -CONT "${pid}" >/dev/null 2>&1 || true
+  done
+}
+# Interrupted, the reap leaves what it froze running again rather than stopped for good.
+trap 'resume_frozen; exit 130' INT TERM HUP
+while :; do
+  # shellcheck disable=SC2207  # mapfile is bash 4+; macOS ships bash 3.2
+  pending=($(children_outside "${members}"))
+  [ "${#pending[@]}" -gt 0 ] || break
+  for pid in "${pending[@]}"; do
+    kill -STOP "${pid}" >/dev/null 2>&1 || true
+    members="${members}${pid} "
+    frozen+=("${pid}")
+    frozen_at+=("$(start_time "${pid}")")
+  done
+done
 
 terminate_pids "${pids[@]}"
 
@@ -88,55 +102,23 @@ if [ "${#survivors[@]}" -gt 0 ]; then
   for pid in "${survivors[@]}"; do
     describe_pid "${pid}" >&2
   done
+  resume_frozen
   exit 1
 fi
 
-# A daemon too wedged to service SIGTERM is SIGKILLed, and SIGKILL runs none of its pane
-# teardown: its pane children are reparented to init, holding the PTYs the daemon held.
-# Reaping without this turns one leaked daemon into several leaked shells and calls it
-# success — manufacturing precisely what `no_leak_guard.sh` exists to catch.
-#
-# Attribution is LINEAGE, not timing. "Appeared between two snapshots" is not ownership:
-# anything else in this checkout that orphans a process during the reap window looks
-# identical, and since shux auto-starts a daemon on first use, a concurrent command mints
-# one that passes every test a timing sweep applies — measured, an earlier version of
-# this killed exactly that. Each pid below descended from a daemon we stopped, and still
-# has the start time it had then, so it is that process and not one reusing its pid. Its
-# parent now says nothing: init, a subreaper, or a zombie daemon not yet torn down.
+# Each still has the start time it had when frozen, so it is that process and not one
+# reusing its pid; a process it would be is frozen, so cannot have been replaced.
 stranded=()
-set +u
-for entry in "${descendants[@]:-}"; do
-  [ -n "${entry}" ] || continue
-  pid="${entry%%=*}"
-  pid_is_gone "${pid}" && continue
-  [ "$(start_time "${pid}")" = "${entry#*=}" ] || continue
-  stranded+=("${pid}")
+i=0
+while [ "${i}" -lt "${#frozen[@]}" ]; do
+  pid="${frozen[${i}]}"
+  if ! pid_is_gone "${pid}" && [ "$(start_time "${pid}")" = "${frozen_at[${i}]}" ]; then
+    stranded+=("${pid}")
+  fi
+  i=$((i + 1))
 done
-set -u
-
-# The live children of any pid in a space-padded set, not already in it.
-children_outside() {
-  ps -axo pid=,ppid= | awk -v set="$1" 'index(set, " " $2 " ") && !index(set, " " $1 " ") { print $1 }'
-}
 
 if [ "${#stranded[@]}" -gt 0 ]; then
-  # Frozen before they are killed: a stranded process that outlived SIGHUP may still be
-  # forking, and a child born after the walk above would outlive the reap. Stopped
-  # parents keep their children's ppid pointing at them, so the walk below reaches a
-  # fixpoint. Lineage still decides: each pid added is a child of a stopped one.
-  frozen=" "
-  pending=("${stranded[@]}")
-  while [ "${#pending[@]}" -gt 0 ]; do
-    for pid in "${pending[@]}"; do
-      case "${frozen}" in *" ${pid} "*) continue ;; esac
-      kill -STOP "${pid}" >/dev/null 2>&1 || true
-      frozen="${frozen}${pid} "
-    done
-    # shellcheck disable=SC2207  # mapfile is bash 4+; macOS ships bash 3.2
-    pending=($(children_outside "${frozen}"))
-  done
-  # shellcheck disable=SC2206  # split on the spaces that pad the set
-  stranded=(${frozen})
   echo "reap: stopping ${#stranded[@]} process(es) stranded by the reaped daemon(s)"
   for pid in "${stranded[@]}"; do
     describe_pid "${pid}"
@@ -151,5 +133,6 @@ if [ "${#stranded[@]}" -gt 0 ]; then
     exit 1
   fi
 fi
+trap - INT TERM HUP
 
 echo "reaped ${#pids[@]} shux daemon(s)"
