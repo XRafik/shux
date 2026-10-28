@@ -34,16 +34,51 @@ fn file_id(path: &Path) -> io::Result<(u64, u64)> {
 }
 
 fn bind_at(path: &Path) -> io::Result<(UnixListener, (u64, u64))> {
-    use std::os::unix::fs::PermissionsExt;
+    use nix::sys::stat::{FchmodatFlags, Mode, fchmodat};
     let listener = UnixListener::bind(path)?;
-    // PRD §13.1.
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    // PRD §13.1. Never through a symlink: whoever can write the directory can
+    // swap the name between the bind and the chmod.
+    fchmodat(
+        nix::fcntl::AT_FDCWD,
+        path,
+        Mode::S_IRWXU,
+        FchmodatFlags::NoFollowSymlink,
+    )?;
     Ok((listener, file_id(path)?))
 }
 
+/// Whether something listens at `path`. Never blocks: a listener that stopped
+/// accepting fills its backlog, and a blocking connect would then wait on it
+/// for good. A full backlog counts as live.
+fn is_served(path: &Path) -> bool {
+    use nix::errno::Errno;
+    use nix::fcntl::{FcntlArg, OFlag, fcntl};
+    use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, connect, socket};
+    use std::os::fd::AsRawFd;
+    let Ok(addr) = UnixAddr::new(path) else {
+        return false;
+    };
+    let Ok(fd) = socket(
+        AddressFamily::Unix,
+        SockType::Stream,
+        SockFlag::empty(),
+        None,
+    ) else {
+        return false;
+    };
+    if fcntl(&fd, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).is_err() {
+        return false;
+    }
+    matches!(
+        connect(fd.as_raw_fd(), &addr),
+        Ok(()) | Err(Errno::EAGAIN | Errno::EINPROGRESS)
+    )
+}
+
 /// Whether nobody else can put a file at a name in `path`'s directory: it is
-/// not a symlink, and is ours and unwritable by others, or sticky. A rebind
-/// binds and chmods by path, so anywhere weaker it could be redirected.
+/// not a symlink, and is ours and unwritable by others, or sticky and ours or
+/// root's. A sticky directory's owner can still unlink and replace any name in
+/// it, so one owned by another user is not private.
 fn parent_is_private(path: &Path) -> bool {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let parent = match path.parent() {
@@ -58,15 +93,16 @@ fn parent_is_private(path: &Path) -> bool {
         return false;
     };
     dir.metadata().is_ok_and(|meta| {
-        let mine = meta.uid() == nix::unistd::geteuid().as_raw() && meta.mode() & 0o022 == 0;
-        mine || meta.mode() & 0o1000 != 0
+        let mine = meta.uid() == nix::unistd::geteuid().as_raw();
+        let sticky = meta.mode() & 0o1000 != 0;
+        (mine && meta.mode() & 0o022 == 0) || (sticky && (mine || meta.uid() == 0))
     })
 }
 
 impl OwnedSocket {
     /// Bind `path`, replacing a stale file there but never a live socket.
     pub fn bind(path: &Path) -> io::Result<Self> {
-        if std::os::unix::net::UnixStream::connect(path).is_ok() {
+        if is_served(path) {
             return Err(io::Error::new(
                 io::ErrorKind::AddrInUse,
                 format!("{} is already being served", path.display()),
@@ -131,5 +167,129 @@ impl Drop for OwnedSocket {
         if file_id(&self.path).is_ok_and(|id| id == self.id) {
             let _ = std::fs::remove_file(&self.path);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::fd::{AsRawFd, OwnedFd};
+
+    /// Connections queued on `path` until its listener's backlog refuses more.
+    fn fill_backlog(path: &Path) -> Vec<OwnedFd> {
+        use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, connect, socket};
+        let addr = UnixAddr::new(path).expect("socket address");
+        let mut queued = Vec::new();
+        loop {
+            let fd = socket(
+                AddressFamily::Unix,
+                SockType::Stream,
+                SockFlag::empty(),
+                None,
+            )
+            .expect("socket");
+            nix::fcntl::fcntl(
+                &fd,
+                nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+            )
+            .expect("nonblocking");
+            match connect(fd.as_raw_fd(), &addr) {
+                Ok(()) => queued.push(fd),
+                Err(nix::errno::Errno::EAGAIN) => return queued,
+                Err(e) => panic!("connect: {e}"),
+            }
+            assert!(queued.len() < 100_000, "the backlog never filled");
+        }
+    }
+
+    /// A listener that stopped accepting is still live, and finding that out
+    /// must not wedge the caller on its full queue.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_listener_with_a_full_backlog_is_occupied_not_waited_on() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("s.sock");
+        let held = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+        let _queued = fill_backlog(&path);
+        let probe = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::task::spawn_blocking({
+                let path = path.clone();
+                let rt = tokio::runtime::Handle::current();
+                move || {
+                    let _rt = rt.enter();
+                    OwnedSocket::bind(&path).map(|_| ())
+                }
+            })
+            .await
+        })
+        .await;
+        drop(held);
+        let result = probe.expect("bind blocked on a listener with a full backlog");
+        let err = result
+            .expect("probe task")
+            .expect_err("bound over a live listener");
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+    }
+
+    /// A sticky directory's owner can replace any name in it, so a rebind
+    /// there is only safe when that owner is us or root. Needs root, to hand
+    /// the directory to another user.
+    #[test]
+    fn a_sticky_directory_another_user_owns_is_not_private() {
+        use std::os::unix::fs::PermissionsExt;
+        if !nix::unistd::geteuid().is_root() {
+            eprintln!("skipped: chown to another user needs root");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("temp dir");
+        let shared = dir.path().join("shared");
+        std::fs::create_dir(&shared).expect("mkdir");
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).expect("chmod");
+        assert!(
+            parent_is_private(&shared.join("s.sock")),
+            "a sticky dir of ours"
+        );
+        std::os::unix::fs::chown(&shared, Some(65534), None).expect("chown");
+        assert!(!parent_is_private(&shared.join("s.sock")));
+    }
+
+    /// What `bind_at` relies on: its chmod fails on a symlink rather than
+    /// changing the file the link points at.
+    #[test]
+    fn the_socket_chmod_does_not_follow_a_symlink() {
+        use nix::sys::stat::{FchmodatFlags, Mode, fchmodat};
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let target = dir.path().join("target");
+        std::fs::write(&target, "").expect("target");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        let link = dir.path().join("s.sock");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        let chmod = fchmodat(
+            nix::fcntl::AT_FDCWD,
+            &link,
+            Mode::S_IRWXU,
+            FchmodatFlags::NoFollowSymlink,
+        );
+        let mode = std::fs::metadata(&target)
+            .expect("stat")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o644,
+            "the chmod reached the link's target ({chmod:?})"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_socket_file_is_replaced() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("s.sock");
+        drop(std::os::unix::net::UnixListener::bind(&path).expect("bind"));
+        assert!(path.exists(), "the stale file is the precondition");
+        let socket = OwnedSocket::bind(&path).expect("replace the stale socket");
+        assert!(std::os::unix::net::UnixStream::connect(&path).is_ok());
+        drop(socket);
+        assert!(!path.exists(), "drop leaves its own socket behind");
     }
 }
