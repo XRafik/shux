@@ -732,6 +732,25 @@ mod tests {
         finish(h).await;
     }
 
+    /// Lines in `log` once it has at least one, waiting up to 5s for it.
+    async fn starts(log: &std::path::Path) -> usize {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let n = std::fs::read_to_string(log)
+                .unwrap_or_default()
+                .lines()
+                .count();
+            if n > 0 || std::time::Instant::now() > deadline {
+                return n;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    async fn incarnation(h: &RpcHarness, pane: PaneId) -> Option<u64> {
+        h.io.lock().await.incarnations.get(&pane).copied()
+    }
+
     /// Two spawns racing for a pane that has none (create's background spawn
     /// and an attach) must run its command once, not twice.
     #[tokio::test(flavor = "multi_thread")]
@@ -747,12 +766,63 @@ mod tests {
         );
         a.unwrap();
         b.unwrap();
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let starts = std::fs::read_to_string(&log)
-            .unwrap_or_default()
-            .lines()
-            .count();
-        assert_eq!(starts, 1, "the pane's command ran {starts} times");
+        assert_eq!(starts(&log).await, 1, "the pane's command did not run once");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(starts(&log).await, 1, "the pane's command ran again");
+        finish(h).await;
+    }
+
+    /// The second of two racing spawns can arrive after the first has
+    /// finished; it must still find the pane started and not run it again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pane_spawned_again_after_its_first_spawn_finished_runs_once() {
+        let h = RpcHarness::new();
+        let (_s, _w, pane) = h.seed_session("status-late").await;
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("starts");
+        let script = format!("echo start >> '{}'; sleep 30", log.display());
+        spawn_sh_result(&h, pane, &script).await.unwrap();
+        assert_eq!(starts(&log).await, 1, "the pane's command never ran");
+        let first = incarnation(&h, pane).await;
+        spawn_sh_result(&h, pane, &script).await.unwrap();
+        assert_eq!(
+            incarnation(&h, pane).await,
+            first,
+            "the pane was spawned again"
+        );
+        finish(h).await;
+    }
+
+    /// A late spawn of a pane whose command already ran and exited must not
+    /// run it again: the pane is finished, not new.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pane_whose_command_exited_is_not_spawned_again() {
+        let h = RpcHarness::new();
+        let (_s, _w, pane) = h.seed_session("status-exited-late").await;
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("starts");
+        let script = format!("echo start >> '{}'", log.display());
+        spawn_sh_result(&h, pane, &script).await.unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while h.graph.snapshot().panes[&pane].exit_status.is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the command never exited"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let first = incarnation(&h, pane).await;
+        spawn_sh_result(&h, pane, &script).await.unwrap();
+        assert_eq!(
+            incarnation(&h, pane).await,
+            first,
+            "the exited pane was spawned again"
+        );
+        assert_eq!(
+            h.graph.snapshot().panes[&pane].exit_status,
+            Some(0),
+            "the exit was cleared"
+        );
         finish(h).await;
     }
 
