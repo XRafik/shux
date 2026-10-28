@@ -770,7 +770,10 @@ impl PtyHandle {
 
         let child = cmd.spawn().map_err(PtyError::Spawn)?;
         let pid = child.id();
-        let pty = AsyncFd::new(pty_pair.master).map_err(PtyError::Open)?;
+        // SAFETY: the `OwnedFd` moves into the `AsyncFd` and is closed only when
+        // it drops, so its fd stays open and names the same description.
+        let pty =
+            unsafe { AsyncFd::register(pty_pair.master) }.map_err(|e| PtyError::Open(e.into()))?;
 
         info!(pid, cmd = ?cmd_parts, cwd = %config.cwd.display(), "PTY child spawned");
 
