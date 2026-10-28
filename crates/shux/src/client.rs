@@ -34,7 +34,7 @@ const MAX_BACKOFF: Duration = Duration::from_millis(2000);
 
 /// How long a daemon gets to exit after it stops serving. It drains panes for
 /// up to 3s before it releases the instance lock.
-const STALE_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const STALE_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long a daemon gets to answer the version handshake. One that does not is
 /// stopped or wedged: it is reported, never replaced.
@@ -143,14 +143,16 @@ async fn check_daemon_version(stream: &mut UnixStream) -> Option<DaemonVersion> 
 /// answers `kill(pid, 0)`. A server that is not one of our daemons is left
 /// alone: unlinking its socket would strand it running and unreachable.
 async fn stop_stale_daemon(socket: &Path) -> Result<(), ClientError> {
-    let pid = crate::daemon_boot::our_live_daemon(socket);
-    if let Some(pid) = pid {
+    if let Some(pid) = crate::daemon_boot::our_live_daemon(socket) {
         // ESRCH means it is already gone, which the wait below sees too.
-        let _ = nix::sys::signal::kill(
+        if nix::sys::signal::kill(
             nix::unistd::Pid::from_raw(pid as i32),
             nix::sys::signal::Signal::SIGTERM,
-        );
-        info!(pid, "Sent SIGTERM to stale daemon");
+        )
+        .is_ok()
+        {
+            info!(pid, "Sent SIGTERM to stale daemon");
+        }
         let deadline = tokio::time::Instant::now() + STALE_EXIT_TIMEOUT;
         while crate::daemon_boot::is_live_shux_daemon(pid, socket) {
             if tokio::time::Instant::now() >= deadline {

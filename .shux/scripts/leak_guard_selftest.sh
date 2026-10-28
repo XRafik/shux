@@ -365,6 +365,8 @@ tree_pids() {
 # daemon's SIGKILL strands a grandchild that outlives the pane's own shell. With
 # `subreaper`, the daemon is started below a child subreaper, as under `systemd --user`
 # on a desktop: its orphans are adopted by that, not by init, and nothing reaps them.
+# With `forking`, the pane keeps forking children that ignore HUP and TERM, so some are
+# born after the reaper's first walk of the tree.
 reap_wedged_daemon() {
   local mode="$1" wedge_runtime wedge_pid wedge_tree bystander_needle bystander_pidfile
   local bystander_pid wedge_reap_status bystander_alive pid holder="" ready
@@ -382,8 +384,13 @@ reap_wedged_daemon() {
     exit 1
   }
   bystander_needle="leak-guard-bystander-$$"
+  local pane="trap '' HUP; sleep 401 & exec sleep 400"
+  # Unique to this run, so the survivor scan below cannot count another suite's sleeps.
+  local fork_needle="7$$"
+  [ "${mode}" != forking ] ||
+    pane="trap '' HUP TERM; while :; do sleep ${fork_needle} & sleep 0.05; done"
   set -- env -u SHUX_SOCKET XDG_RUNTIME_DIR="${wedge_runtime}" "${shux_bin}" --format json \
-    session create leak-guard-wedge-$$ -d -- sh -c "trap '' HUP; sleep 401 & exec sleep 400"
+    session create leak-guard-wedge-$$ -d -- sh -c "${pane}"
   if [ "${mode}" = subreaper ]; then
     ready="${wedge_runtime}/subreaper-ready"
     python3 -c '
@@ -451,6 +458,12 @@ time.sleep(600)
   for pid in ${wedge_tree}; do
     pid_is_gone "${pid}" || survivors="${survivors} ${pid}"
   done
+  if [ "${mode}" = forking ]; then
+    # shellcheck disable=SC2009  # ps|grep is required by the process-hygiene rule
+    for pid in $(ps -axo pid=,args= | grep -E "^ *[0-9]+ sleep ${fork_needle}\$" | awk '{ print $1 }'); do
+      case " ${survivors} " in *" ${pid} "*) ;; *) pid_is_gone "${pid}" || survivors="${survivors} ${pid}" ;; esac
+    done
+  fi
   for pid in ${survivors}; do
     echo "reap_daemons.sh left the wedged daemon's pane process running (${pid})" >&2
     describe_pid "${pid}" >&2
@@ -478,6 +491,7 @@ time.sleep(600)
 # checkout is running, so a real reap cannot reach a concurrent session's work.
 if [ -z "$(shux_daemon_pids)" ]; then
   reap_wedged_daemon plain
+  reap_wedged_daemon forking
   # PR_SET_CHILD_SUBREAPER is Linux-only.
   if [ "$(uname -s)" = "Linux" ]; then
     reap_wedged_daemon subreaper

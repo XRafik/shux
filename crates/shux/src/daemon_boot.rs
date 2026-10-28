@@ -35,9 +35,10 @@ pub fn run_daemon(socket_override: Option<PathBuf>) -> anyhow::Result<()> {
 
     // Step 1: Daemonize BEFORE tokio. The instance lock is held until this
     // function returns, which is after its socket and pidfile are removed.
-    let Some(_instance_lock) = daemon::daemonize(&sock_path)? else {
+    let Some(instance_lock) = daemon::daemonize(&sock_path)? else {
         return Ok(());
     };
+    let instance_lock = Arc::new(instance_lock);
 
     // Step 2: Now we are the daemon process — create tokio runtime
     let rt = tokio::runtime::Runtime::new()?;
@@ -56,9 +57,34 @@ pub fn run_daemon(socket_override: Option<PathBuf>) -> anyhow::Result<()> {
         // Start signal handler
         daemon::spawn_signal_handler(cmd_tx.clone(), tokens.clone()).await?;
 
-        // Ensure runtime dir and clean up stale socket
         let runtime_dir = daemon::ensure_runtime_dir()?;
-        daemon::remove_socket_file_for(&sock_path)?;
+
+        // Once another daemon holds the instance lock it serves the socket;
+        // staying would leave this one's sessions reachable by nobody.
+        {
+            let lock = instance_lock.clone();
+            let cancel = tokens.root.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(shux_rpc::uds::CHECK_INTERVAL);
+                loop {
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        _ = tick.tick() => {}
+                    }
+                    let lock = lock.clone();
+                    let custody = tokio::task::spawn_blocking(move || lock.check()).await;
+                    if custody.is_ok_and(|c| c == daemon::Custody::Lost) {
+                        tracing::error!("another daemon took the instance lock; shutting down");
+                        cancel.cancel();
+                        break;
+                    }
+                }
+            });
+        }
+        let rebind_gate: shux_rpc::uds::RebindGate = {
+            let lock = instance_lock.clone();
+            Arc::new(move || lock.check() == daemon::Custody::Held)
+        };
 
         // Daemon-level lens audit log (LENS-R-052): ONE instance for the
         // whole daemon — the chain head is cached in memory, so a second
@@ -92,6 +118,7 @@ pub fn run_daemon(socket_override: Option<PathBuf>) -> anyhow::Result<()> {
         let cancel = tokens.root.clone();
         let io_state = run_rpc_server(
             sock_path.clone(),
+            rebind_gate,
             cancel.clone(),
             lens_audit,
             unresolved_scratch,
@@ -123,36 +150,52 @@ pub fn run_daemon(socket_override: Option<PathBuf>) -> anyhow::Result<()> {
 #[derive(Debug)]
 #[allow(dead_code)]
 enum ProcessArgv {
-    /// From `/proc`: boundaries are real. Linux only.
-    Exact(Vec<String>),
+    /// From `/proc`: boundaries are real, and the cwd a relative `--socket`
+    /// resolves against is known. Linux only.
+    Exact(Vec<String>, Option<PathBuf>),
     /// From `ps`: space-joined, boundaries unrecoverable.
     Joined(String),
 }
 
-/// The argv of `pid`, or `None` if it cannot be read.
+/// The argv of `pid`, or `None` if it cannot be read or `pid` is another
+/// user's: argv is anyone's to choose, and root can signal anything.
 /// `/proc` is authoritative here, empty included: `cmdline` reads back empty
 /// mid-exec and for zombies, and `None` makes the caller poll again rather than
 /// fall through to the lossy `ps` path.
 #[cfg(target_os = "linux")]
 fn process_argv(pid: u32) -> Option<ProcessArgv> {
+    use std::os::unix::fs::MetadataExt;
+    let owner = std::fs::metadata(format!("/proc/{pid}")).ok()?.uid();
+    if owner != nix::unistd::geteuid().as_raw() {
+        return None;
+    }
     let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
     let argv: Vec<String> = raw
         .split(|b| *b == 0)
         .filter(|arg| !arg.is_empty())
         .map(|arg| String::from_utf8_lossy(arg).into_owned())
         .collect();
-    (!argv.is_empty()).then_some(ProcessArgv::Exact(argv))
+    let cwd = std::fs::read_link(format!("/proc/{pid}/cwd")).ok();
+    (!argv.is_empty()).then_some(ProcessArgv::Exact(argv, cwd))
 }
 
 /// `-ww` is not optional: BSD `ps` truncates argv without it.
 #[cfg(not(target_os = "linux"))]
 fn process_argv(pid: u32) -> Option<ProcessArgv> {
     let out = std::process::Command::new("ps")
-        .args(["-ww", "-p", &pid.to_string(), "-o", "args="])
+        .args(["-ww", "-p", &pid.to_string(), "-o", "uid=,args="])
         .output()
         .ok()?;
-    let joined = String::from_utf8_lossy(&out.stdout).trim_end().to_string();
-    (!joined.is_empty()).then_some(ProcessArgv::Joined(joined))
+    joined_if_ours(String::from_utf8_lossy(&out.stdout).trim())
+}
+
+/// A `uid args` line from `ps`, kept only when `uid` is ours.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+fn joined_if_ours(line: &str) -> Option<ProcessArgv> {
+    let (uid, args) = line.split_once(' ')?;
+    let args = args.trim();
+    (uid.parse() == Ok(nix::unistd::geteuid().as_raw()) && !args.is_empty())
+        .then(|| ProcessArgv::Joined(args.to_string()))
 }
 
 /// Whether a space-joined argv serves exactly `socket`.
@@ -183,9 +226,10 @@ fn served_socket(argv: &[String]) -> Option<PathBuf> {
     None
 }
 
-/// Whether two socket paths name the same endpoint, socket file present or not.
+/// Whether two absolute socket paths name the same endpoint, socket file
+/// present or not.
 fn same_socket(a: &Path, b: &Path) -> bool {
-    a == b || daemon::socket_key(a) == daemon::socket_key(b)
+    daemon::socket_key(a) == daemon::socket_key(b)
 }
 
 /// True when `pid` is alive AND is a shux daemon serving `socket`.
@@ -205,7 +249,7 @@ pub(crate) fn is_live_shux_daemon(pid: u32, socket: &Path) -> bool {
 impl ProcessArgv {
     fn serves(&self, socket: &Path) -> bool {
         match self {
-            ProcessArgv::Exact(argv) => argv_is_daemon_for(argv, socket),
+            ProcessArgv::Exact(argv, cwd) => argv_is_daemon_for(argv, cwd.as_deref(), socket),
             // Daemons spawn with the socket's key; earlier builds, as typed.
             ProcessArgv::Joined(joined) => {
                 joined.contains(" __daemon")
@@ -232,7 +276,7 @@ fn all_processes() -> Vec<(u32, ProcessArgv)> {
 #[cfg(not(target_os = "linux"))]
 fn all_processes() -> Vec<(u32, ProcessArgv)> {
     let Ok(out) = std::process::Command::new("ps")
-        .args(["-ww", "-Ao", "pid=,args="])
+        .args(["-ww", "-Ao", "pid=,uid=,args="])
         .output()
     else {
         return Vec::new();
@@ -240,24 +284,53 @@ fn all_processes() -> Vec<(u32, ProcessArgv)> {
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter_map(|line| {
-            let (pid, args) = line.trim_start().split_once(' ')?;
-            Some((
-                pid.parse().ok()?,
-                ProcessArgv::Joined(args.trim_end().to_string()),
-            ))
+            let (pid, rest) = line.trim().split_once(' ')?;
+            Some((pid.parse().ok()?, joined_if_ours(rest.trim_start())?))
         })
         .collect()
 }
 
-/// Whether `argv` is a shux daemon serving `socket`. Split out so it can be
-/// tested against hand-built argv.
-fn argv_is_daemon_for(argv: &[String], socket: &Path) -> bool {
+/// Whether `argv`, run in `cwd`, is a shux daemon serving `socket`. Split out
+/// so it can be tested against hand-built argv.
+fn argv_is_daemon_for(argv: &[String], cwd: Option<&Path>, socket: &Path) -> bool {
     // Exact argv position, not a substring match (085 QA P3): a bystander whose command line
     // merely CONTAINS both words -- say `watch-for shux __daemon` -- must not be accepted.
     if argv.get(1).map(String::as_str) != Some("__daemon") {
         return false;
     }
-    served_socket(argv).is_some_and(|served| same_socket(&served, socket))
+    served_socket(argv)
+        .and_then(|served| match served.is_absolute() {
+            true => Some(served),
+            false => cwd.map(|cwd| cwd.join(served)),
+        })
+        .is_some_and(|served| same_socket(&served, socket))
+}
+
+/// Whether `pid` holds the instance lock for `socket` open. Linux only: on
+/// other platforms argv and owner are all there is to go on.
+fn holds_instance_lock(pid: u32, socket: &Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let id = |m: std::fs::Metadata| (m.dev(), m.ino());
+        let Some(lock) = daemon::instance_lock_path_for(socket)
+            .ok()
+            .and_then(|path| std::fs::metadata(path).ok())
+        else {
+            return false;
+        };
+        let lock = id(lock);
+        std::fs::read_dir(format!("/proc/{pid}/fd"))
+            .into_iter()
+            .flatten()
+            .filter_map(|fd| std::fs::metadata(fd.ok()?.path()).ok())
+            .any(|m| id(m) == lock)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (pid, socket);
+        true
+    }
 }
 
 /// The pid of our live daemon for `socket`.
@@ -275,15 +348,18 @@ pub(crate) fn our_live_daemon(socket: &Path) -> Option<u32> {
         .ok()?
         .iter()
         .find_map(|pidfile| live(pidfile));
-    // A daemon from before the instance lock whose pidfile was lost is named by
-    // nothing at all, so its own argv is the last place left to look.
+    // A daemon whose pidfile was lost and whose pid in the lock was overwritten
+    // is named by nothing, so the process table is the last place left to look.
     named
         .or_else(|| live(&daemon::instance_lock_path_for(socket).ok()?))
         .or_else(|| {
             all_processes()
                 .into_iter()
                 .find(|(pid, argv)| {
-                    *pid > 1 && argv.serves(socket) && is_live_shux_daemon(*pid, socket)
+                    *pid > 1
+                        && argv.serves(socket)
+                        && holds_instance_lock(*pid, socket)
+                        && is_live_shux_daemon(*pid, socket)
                 })
                 .map(|(pid, _)| pid)
         })
@@ -342,7 +418,7 @@ pub(crate) fn handle_daemon_command(
             // Identity, not `kill(pid, 0)`: an exited daemon stays a zombie until
             // its parent reaps it, which a subreaper may never do. The budget
             // outlasts the daemon's 3s pane drain.
-            const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+            const STOP_TIMEOUT: std::time::Duration = crate::client::STALE_EXIT_TIMEOUT;
             let deadline = std::time::Instant::now() + STOP_TIMEOUT;
             let mut gone = !is_live_shux_daemon(p, socket);
             while !gone && std::time::Instant::now() < deadline {
@@ -381,6 +457,7 @@ pub(crate) fn handle_daemon_command(
 /// Both run until `cancel` is triggered.
 pub(crate) async fn run_rpc_server(
     socket_path: PathBuf,
+    rebind_gate: shux_rpc::uds::RebindGate,
     cancel: tokio_util::sync::CancellationToken,
     lens_audit: Arc<lens_scratch::LensAuditLog>,
     unresolved_scratch: Vec<lens_scratch::RegistryRow>,
@@ -481,6 +558,7 @@ pub(crate) async fn run_rpc_server(
     let attach_segments = segment_cache.clone();
     let attach_meta = session_meta_cache.clone();
     let attach_onboarding = onboarding.clone();
+    let attach_gate = rebind_gate.clone();
     tokio::spawn(async move {
         if let Err(e) = attach::run_attach_server(
             attach_path,
@@ -491,6 +569,7 @@ pub(crate) async fn run_rpc_server(
             attach_meta,
             attach_onboarding,
             daemon_start,
+            attach_gate,
             attach_cancel,
         )
         .await
@@ -655,7 +734,8 @@ pub(crate) async fn run_rpc_server(
         auth_token: None,
     };
 
-    let server = shux_rpc::Server::new(config, router, cancel.clone());
+    let server =
+        shux_rpc::Server::new(config, router, cancel.clone()).with_rebind_gate(rebind_gate);
 
     tokio::spawn(async move {
         if let Err(e) = server.run().await {
@@ -772,7 +852,7 @@ mod tests {
         loop {
             let argv = super::process_argv(child.id());
             let exec_landed = match &argv {
-                Some(super::ProcessArgv::Exact(v)) => {
+                Some(super::ProcessArgv::Exact(v, _)) => {
                     v.first().is_some_and(|a| a.contains("watch-for"))
                 }
                 Some(super::ProcessArgv::Joined(j)) => j.contains("watch-for"),
@@ -812,14 +892,35 @@ mod tests {
         .map(|s| s.to_string())
         .collect();
         assert!(
-            !super::argv_is_daemon_for(&argv, Path::new("/run/mine/x.sock")),
+            !super::argv_is_daemon_for(&argv, None, Path::new("/run/mine/x.sock")),
             "a daemon serving another socket must never be ours"
         );
         assert!(
-            super::argv_is_daemon_for(&argv, Path::new("/run/other/x.sock")),
+            super::argv_is_daemon_for(&argv, None, Path::new("/run/other/x.sock")),
             "the same argv IS the daemon for the socket it serves -- without this the \
              test would pass on a predicate that rejects everything"
         );
+    }
+
+    /// A relative `--socket` names the socket in the daemon's own cwd.
+    #[test]
+    fn a_relative_socket_resolves_against_the_daemons_cwd() {
+        let argv: Vec<String> = ["/opt/shux", "__daemon", "--socket", "rel.sock"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mine = Path::new("/nonexistent-shux-a/rel.sock");
+        assert!(super::argv_is_daemon_for(
+            &argv,
+            Some(Path::new("/nonexistent-shux-a")),
+            mine
+        ));
+        assert!(!super::argv_is_daemon_for(
+            &argv,
+            Some(Path::new("/nonexistent-shux-b")),
+            mine
+        ));
+        assert!(!super::argv_is_daemon_for(&argv, None, mine));
     }
 
     /// Identity does not depend on what the executable is called.
@@ -834,7 +935,7 @@ mod tests {
                 .map(|s| s.to_string())
                 .collect();
             assert!(
-                super::argv_is_daemon_for(&argv, Path::new("/run/mine/x.sock")),
+                super::argv_is_daemon_for(&argv, None, Path::new("/run/mine/x.sock")),
                 "{exe} serving our socket is our daemon whatever it is called"
             );
         }
@@ -855,6 +956,7 @@ mod tests {
         .collect();
         assert!(!super::argv_is_daemon_for(
             &argv,
+            None,
             Path::new("/run/mine/x.sock")
         ));
     }
@@ -904,6 +1006,17 @@ mod tests {
         assert!(joined.serves(spelling));
         assert!(joined.serves(&key));
         assert!(!joined.serves(Path::new("/nonexistent-shux-test/y.sock")));
+    }
+
+    /// A `ps` line is only ours when its owner is.
+    #[test]
+    fn a_ps_line_is_kept_only_for_our_uid() {
+        let me = nix::unistd::geteuid().as_raw();
+        let line = format!("{me}   /opt/shux __daemon --socket /a/x.sock");
+        assert!(super::joined_if_ours(&line).is_some_and(|a| a.serves(Path::new("/a/x.sock"))));
+        let theirs = format!("{} /opt/shux __daemon --socket /a/x.sock", me + 1);
+        assert!(super::joined_if_ours(&theirs).is_none());
+        assert!(super::joined_if_ours(&format!("{me}")).is_none());
     }
 
     /// An argv with no `--socket` is nobody's daemon, on either platform.

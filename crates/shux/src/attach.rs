@@ -146,9 +146,12 @@ pub async fn run_attach_server(
     meta_cache: crate::session_meta::SessionMetaCache,
     onboarding: crate::onboarding::OnboardingHandle,
     daemon_start: std::time::Instant,
+    rebind_gate: shux_rpc::uds::RebindGate,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     let mut socket = shux_rpc::uds::OwnedSocket::bind(&socket_path)?;
+    // Losing only the attach socket leaves the daemon serving everything else.
+    let mut lost = false;
     let mut socket_check = tokio::time::interval(shux_rpc::uds::CHECK_INTERVAL);
     socket_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     info!(path = %socket_path.display(), "attach UDS listener bound");
@@ -159,7 +162,12 @@ pub async fn run_attach_server(
                 info!("attach server shutting down");
                 break;
             }
-            _ = socket_check.tick() => socket.rebind_if_missing(),
+            _ = socket_check.tick(), if !lost => {
+                if let Err(e) = socket.check(Some(&rebind_gate)) {
+                    warn!(error = %e, "attach socket lost");
+                    lost = true;
+                }
+            }
             res = socket.listener().accept() => {
                 match res {
                     Ok((stream, _)) => {

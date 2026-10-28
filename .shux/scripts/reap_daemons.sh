@@ -114,12 +114,42 @@ for entry in "${descendants[@]:-}"; do
 done
 set -u
 
+# The live children of any pid in a space-padded set, not already in it.
+children_outside() {
+  ps -axo pid=,ppid= | awk -v set="$1" 'index(set, " " $2 " ") && !index(set, " " $1 " ") { print $1 }'
+}
+
 if [ "${#stranded[@]}" -gt 0 ]; then
+  # Frozen before they are killed: a stranded process that outlived SIGHUP may still be
+  # forking, and a child born after the walk above would outlive the reap. Stopped
+  # parents keep their children's ppid pointing at them, so the walk below reaches a
+  # fixpoint. Lineage still decides: each pid added is a child of a stopped one.
+  frozen=" "
+  pending=("${stranded[@]}")
+  while [ "${#pending[@]}" -gt 0 ]; do
+    for pid in "${pending[@]}"; do
+      case "${frozen}" in *" ${pid} "*) continue ;; esac
+      kill -STOP "${pid}" >/dev/null 2>&1 || true
+      frozen="${frozen}${pid} "
+    done
+    # shellcheck disable=SC2207  # mapfile is bash 4+; macOS ships bash 3.2
+    pending=($(children_outside "${frozen}"))
+  done
+  # shellcheck disable=SC2206  # split on the spaces that pad the set
+  stranded=(${frozen})
   echo "reap: stopping ${#stranded[@]} process(es) stranded by the reaped daemon(s)"
   for pid in "${stranded[@]}"; do
     describe_pid "${pid}"
   done
   terminate_pids "${stranded[@]}"
+  left=()
+  for pid in "${stranded[@]}"; do
+    pid_is_gone "${pid}" || left+=("${pid}")
+  done
+  if [ "${#left[@]}" -gt 0 ]; then
+    echo "reap: ${#left[@]} stranded process(es) survived KILL: ${left[*]}" >&2
+    exit 1
+  fi
 fi
 
 echo "reaped ${#pids[@]} shux daemon(s)"

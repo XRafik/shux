@@ -34,6 +34,7 @@ pub struct Server {
     config: ServerConfig,
     router: Router,
     cancel: tokio_util::sync::CancellationToken,
+    rebind_gate: Option<crate::uds::RebindGate>,
 }
 
 /// A JSON-RPC 2.0 request (parsed from incoming frames).
@@ -92,7 +93,14 @@ impl Server {
             config,
             router,
             cancel,
+            rebind_gate: None,
         }
+    }
+
+    /// Rebind an unlinked socket only while `gate` says this process may.
+    pub fn with_rebind_gate(mut self, gate: crate::uds::RebindGate) -> Self {
+        self.rebind_gate = Some(gate);
+        self
     }
 
     /// Start the server (UDS + optional TCP).
@@ -124,7 +132,7 @@ impl Server {
                     info!("server shutting down");
                     break;
                 }
-                _ = socket_check.tick() => uds.rebind_if_missing(),
+                _ = socket_check.tick() => uds.check(self.rebind_gate.as_ref())?,
                 // Accept UDS connections.
                 result = uds.listener().accept() => {
                     match result {

@@ -1327,3 +1327,265 @@ fn two_sockets_in_one_runtime_dir_do_not_share_an_attach_socket() {
     let stopped = run_bin(&bin, runtime.path(), None, &["daemon", "stop"]);
     assert!(stopped.status.success(), "daemon stop failed");
 }
+
+/// A spelling with `..` after a directory that does not exist yet reaches the
+/// daemon it starts: the kernel cannot resolve `x/..` until `x` exists.
+#[test]
+fn a_socket_spelled_through_a_missing_directory_is_reached() {
+    let runtime = tempfile::tempdir().expect("temp runtime");
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_shux"));
+    let socket = runtime.path().join("x").join("..").join("a.sock");
+    let mut reaper = Reaper(Vec::new());
+
+    let out = run_bin(&bin, runtime.path(), Some(&socket), &["session", "list"]);
+    for (_, pid) in wait_for_pid_files(&runtime.path().join("shux"), 1) {
+        reaper.0.push(pid as i32);
+    }
+    assert!(
+        out.status.success(),
+        "the client could not reach the daemon it started: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        settle_daemon_count(&runtime.path().join("a.sock"), 1, &mut reaper),
+        1
+    );
+}
+
+/// A relative `--socket` names the socket in the caller's directory: `daemon
+/// stop` from another directory must not stop a daemon serving the same
+/// relative spelling there, and from its own directory it must.
+#[test]
+fn a_relative_socket_names_the_callers_directory() {
+    let runtime = tempfile::tempdir().expect("temp runtime");
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_shux"));
+    let (a, b) = (runtime.path().join("a"), runtime.path().join("b"));
+    std::fs::create_dir(&a).expect("mkdir a");
+    std::fs::create_dir(&b).expect("mkdir b");
+    let mut reaper = Reaper(Vec::new());
+
+    // Spawned as an earlier build would: the relative spelling in its argv.
+    let started = bin_cmd(
+        &bin,
+        runtime.path(),
+        None,
+        &["__daemon", "--socket", "rel.sock"],
+    )
+    .current_dir(&a)
+    .status()
+    .expect("start daemon");
+    assert!(started.success());
+    let (_, pid) = wait_for_pid_files(&runtime.path().join("shux"), 1)
+        .into_iter()
+        .next()
+        .expect("one pidfile");
+    reaper.0.push(pid as i32);
+
+    let elsewhere = bin_cmd(
+        &bin,
+        runtime.path(),
+        Some(Path::new("rel.sock")),
+        &["daemon", "stop"],
+    )
+    .current_dir(&b)
+    .output()
+    .expect("run shux");
+    assert!(
+        String::from_utf8_lossy(&elsewhere.stdout).contains("no daemon running"),
+        "daemon stop in another directory claimed it: {}",
+        String::from_utf8_lossy(&elsewhere.stdout)
+    );
+    assert!(
+        pid_exists(pid),
+        "daemon stop in another directory killed it"
+    );
+
+    let here = bin_cmd(
+        &bin,
+        runtime.path(),
+        Some(Path::new("rel.sock")),
+        &["daemon", "stop"],
+    )
+    .current_dir(&a)
+    .output()
+    .expect("run shux");
+    assert!(
+        wait_for_pid_gone(pid, Duration::from_secs(5)),
+        "daemon stop in its own directory missed it: {}",
+        String::from_utf8_lossy(&here.stdout)
+    );
+}
+
+/// A process that merely carries a daemon's argv is not a daemon: `daemon
+/// status` must not report it and `daemon stop` must not signal it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_process_with_a_daemons_argv_is_not_signalled() {
+    let runtime = tempfile::tempdir().expect("temp runtime");
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_shux"));
+    let socket = runtime.path().join("shux").join("shux.sock");
+    std::fs::write(
+        runtime.path().join("__daemon"),
+        "import time\ntime.sleep(60)\n",
+    )
+    .expect("write bystander");
+    let mut bystander = Command::new("python3")
+        .arg("__daemon")
+        .arg("--socket")
+        .arg(&socket)
+        .current_dir(runtime.path())
+        .spawn()
+        .expect("spawn bystander");
+    let pid = bystander.id();
+    let reaper = Reaper(vec![pid as i32]);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while std::fs::read(format!("/proc/{pid}/cmdline"))
+        .map_or(true, |c| !String::from_utf8_lossy(&c).contains("--socket"))
+    {
+        assert!(Instant::now() < deadline, "bystander never started");
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let status = run_bin(&bin, runtime.path(), None, &["daemon", "status"]);
+    let stopped = run_bin(&bin, runtime.path(), None, &["daemon", "stop"]);
+    let alive = bystander.try_wait().expect("poll bystander").is_none();
+    drop(reaper);
+    let _ = bystander.wait();
+    assert!(
+        String::from_utf8_lossy(&status.stdout).contains("not running"),
+        "daemon status reported the bystander: {}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+    assert!(
+        alive,
+        "daemon stop signalled the bystander: {}",
+        String::from_utf8_lossy(&stopped.stdout)
+    );
+}
+
+/// The attach socket is rebound when it is unlinked, as the RPC socket is: a
+/// daemon from before this build unlinks `attach.sock` on its way out.
+#[test]
+fn a_daemon_whose_attach_socket_was_unlinked_serves_it_again() {
+    let runtime = tempfile::tempdir().expect("temp runtime");
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_shux"));
+    let attach = runtime.path().join("shux").join("attach.sock");
+    let mut reaper = Reaper(Vec::new());
+
+    assert!(
+        run_bin(&bin, runtime.path(), None, &["session", "list"])
+            .status
+            .success()
+    );
+    reaper
+        .0
+        .push(wait_for_pid_file(&runtime.path().join("shux").join("shux.pid")) as i32);
+    std::fs::remove_file(&attach).expect("unlink attach socket");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while std::os::unix::net::UnixStream::connect(&attach).is_err() {
+        assert!(
+            Instant::now() < deadline,
+            "the attach socket was not rebound"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// A client racing the deletion of the whole runtime dir must not leave two
+/// daemons behind: the one whose lock file went with the directory either
+/// takes a fresh lock again or gives way.
+#[test]
+fn deleting_the_runtime_dir_strands_no_daemon() {
+    let runtime = tempfile::tempdir().expect("temp runtime");
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_shux"));
+    let dir = runtime.path().join("shux");
+    let socket = dir.join("shux.sock");
+    let mut reaper = Reaper(Vec::new());
+
+    for round in 0..3 {
+        assert!(
+            run_bin(&bin, runtime.path(), None, &["session", "list"])
+                .status
+                .success(),
+            "round {round}: no daemon"
+        );
+        settle_daemon_count(&socket, 1, &mut reaper);
+        std::fs::remove_dir_all(&dir).expect("delete runtime dir");
+        let out = run_bin(&bin, runtime.path(), None, &["session", "list"]);
+        assert!(
+            out.status.success(),
+            "round {round}: client after the deletion failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            settle_daemon_count(&socket, 1, &mut reaper),
+            1,
+            "round {round}: a daemon was stranded"
+        );
+    }
+}
+
+/// One explicit socket used from two runtime dirs is still served by one
+/// daemon: neither may unlink a socket the other is already serving.
+#[test]
+fn one_socket_from_two_runtime_dirs_gets_one_daemon() {
+    let shared = tempfile::tempdir().expect("socket dir");
+    let (r1, r2) = (
+        tempfile::tempdir().expect("runtime 1"),
+        tempfile::tempdir().expect("runtime 2"),
+    );
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_shux"));
+    let socket = shared.path().join("shared.sock");
+    let mut reaper = Reaper(Vec::new());
+
+    let clients: Vec<_> = (0..32)
+        .map(|i| {
+            let runtime = if i % 2 == 0 { r1.path() } else { r2.path() };
+            bin_cmd(&bin, runtime, Some(&socket), &["session", "list"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn shux")
+        })
+        .collect();
+    for client in clients {
+        let _ = client.wait_with_output().expect("wait for shux");
+    }
+    assert_eq!(
+        settle_daemon_count(&socket, 1, &mut reaper),
+        1,
+        "one socket from two runtime dirs started more than one daemon"
+    );
+}
+
+/// A runtime dir replaced by a symlink is never followed by a rebind: the
+/// socket must not reappear in whatever directory the link points at.
+#[test]
+fn a_rebind_does_not_follow_a_runtime_dir_replaced_by_a_symlink() {
+    let runtime = tempfile::tempdir().expect("temp runtime");
+    let elsewhere = tempfile::tempdir().expect("planted dir");
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_shux"));
+    let dir = runtime.path().join("shux");
+    let mut reaper = Reaper(Vec::new());
+
+    assert!(
+        run_bin(&bin, runtime.path(), None, &["session", "list"])
+            .status
+            .success()
+    );
+    reaper
+        .0
+        .push(wait_for_pid_file(&dir.join("shux.pid")) as i32);
+    std::fs::remove_dir_all(&dir).expect("delete runtime dir");
+    std::os::unix::fs::symlink(elsewhere.path(), &dir).expect("plant symlink");
+    thread::sleep(Duration::from_millis(1500));
+    let planted: Vec<_> = std::fs::read_dir(elsewhere.path())
+        .expect("read planted dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name())
+        .collect();
+    assert!(
+        planted.is_empty(),
+        "the daemon wrote into a symlinked runtime dir: {planted:?}"
+    );
+}
