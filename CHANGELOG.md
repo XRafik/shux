@@ -1,3 +1,10 @@
+## [0.52.1](https://github.com/indrasvat/shux/compare/v0.52.0...v0.52.1) (2026-10-28)
+
+
+### Bug Fixes
+
+* **pty:** a pane that already ran is never spawned again ([#199](https://github.com/indrasvat/shux/issues/199)) ([328e7c7](https://github.com/indrasvat/shux/commit/328e7c745ef877a1c45c2b64dd0e1eb69b4fd719))
+
 # [0.52.0](https://github.com/indrasvat/shux/compare/v0.51.0...v0.52.0) (2026-10-27)
 
 
