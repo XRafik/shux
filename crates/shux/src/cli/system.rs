@@ -56,6 +56,10 @@ pub async fn handle_api(
 }
 
 /// Handle the `shux version` command.
+///
+/// Always reports the CLI's own version and SHA first, then the daemon's
+/// alongside when one answers, flagging it when they differ. A stale daemon
+/// after an upgrade must not masquerade as the installed binary (issue #200).
 pub async fn handle_version(
     stream: &mut tokio::net::UnixStream,
     format: OutputFormat,
@@ -67,20 +71,36 @@ pub async fn handle_version(
     )
     .await?;
 
+    let cli_version = env!("CARGO_PKG_VERSION");
+    let cli_sha = env!("SHUX_GIT_SHA");
+    let daemon_version = result.get("version").and_then(|v| v.as_str());
+    let daemon_sha = result.get("git_sha").and_then(|v| v.as_str());
+
     match format {
         OutputFormat::Json => {
+            let mut envelope = serde_json::json!({
+                "cli": { "version": cli_version, "git_sha": cli_sha },
+                "daemon": { "version": daemon_version, "git_sha": daemon_sha },
+            });
+            if let Some(dv) = daemon_version {
+                envelope["mismatch"] = serde_json::json!(dv != cli_version);
+            }
             println!(
                 "{}",
-                crate::style::json_safe(&serde_json::to_string_pretty(&result)?)
+                crate::style::json_safe(&serde_json::to_string_pretty(&envelope)?)
             );
         }
         OutputFormat::Text | OutputFormat::Plain => {
-            let version = result
-                .get("version")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            let git_sha = result.get("git_sha").and_then(|v| v.as_str());
-            crate::style::print_version(version, git_sha, None);
+            crate::style::print_version(cli_version, Some(cli_sha), Some("cli"));
+            if let Some(dv) = daemon_version {
+                let mismatch = dv != cli_version;
+                let note = if mismatch {
+                    "daemon — versions differ".to_string()
+                } else {
+                    "daemon".to_string()
+                };
+                crate::style::print_version(dv, daemon_sha, Some(&note));
+            }
         }
     }
 

@@ -479,8 +479,160 @@ async fn test_cli_version_json_against_server() {
     );
 
     let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
-    assert!(parsed["version"].is_string());
-    assert_eq!(parsed["name"], "shux");
+    // New contract (issue #200): the CLI reports its own version first, then
+    // the daemon's. The default test server reports the same version as the
+    // binary, so there is no mismatch here.
+    assert_eq!(parsed["cli"]["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(parsed["daemon"]["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(parsed["mismatch"], false);
+
+    cancel.cancel();
+}
+
+// Issue #200: a stale daemon (different version from the installed CLI) must
+// not masquerade as the CLI. `shux version` reports the CLI's own version
+// first, then the daemon's alongside, and flags the mismatch in JSON.
+
+/// Register the builtin `system.version` again (HashMap insert overrides) so
+/// the test server answers with a daemon version different from the binary's
+/// baked-in `CARGO_PKG_VERSION`.
+async fn start_test_server_with_daemon_version(
+    dir: &std::path::Path,
+    daemon_version: &str,
+) -> (PathBuf, tokio_util::sync::CancellationToken) {
+    let socket_path = dir.join("test.sock");
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let (graph, state) = shux_core::graph::SessionGraph::new();
+    let (graph_tx, graph_rx) = tokio::sync::mpsc::channel(256);
+    let graph_handle = shux_core::graph::GraphHandle::new(graph_tx, state);
+    let graph_cancel = cancel.clone();
+    tokio::spawn(async move {
+        shux_core::graph::run_graph_loop(graph, graph_rx, graph_cancel).await;
+    });
+    let dv = daemon_version.to_string();
+    let router = register_session_methods(
+        shux_rpc::server::register_builtin_methods(shux_rpc::Router::builder()),
+        graph_handle,
+    )
+    .register(
+        "system.version",
+        move |_params: Option<serde_json::Value>| {
+            let v = dv.clone();
+            async move {
+                Ok(serde_json::json!({
+                    "version": v,
+                    "git_sha": "oldsha1",
+                    "name": "shux",
+                }))
+            }
+        },
+    )
+    .build();
+    let config = shux_rpc::ServerConfig {
+        socket_path: socket_path.clone(),
+        tcp_addr: String::new(),
+        auth_token: None,
+    };
+    let server = shux_rpc::Server::new(config, router, cancel.clone());
+    tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+    for _ in 0..20 {
+        if UnixStream::connect(&socket_path).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    (socket_path, cancel)
+}
+
+#[tokio::test]
+async fn test_cli_version_flags_stale_daemon_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server_with_daemon_version(dir.path(), "0.51.0").await;
+
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_shux"))
+        .args(["--socket", socket_path.to_str().unwrap(), "version"])
+        .output()
+        .await
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "shux version failed. stdout={stdout}"
+    );
+    // The CLI's own version (baked in at build time) is reported first,
+    // labelled, and the stale daemon's version is shown alongside.
+    assert!(
+        stdout.contains(env!("CARGO_PKG_VERSION")),
+        "expected the CLI version in output: {stdout}"
+    );
+    assert!(
+        stdout.contains("0.51.0"),
+        "expected the daemon version: {stdout}"
+    );
+    assert!(
+        stdout.contains("[cli]"),
+        "expected the [cli] label: {stdout}"
+    );
+    assert!(
+        stdout.contains("versions differ"),
+        "expected a mismatch flag: {stdout}"
+    );
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_cli_version_flags_stale_daemon_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket_path, cancel) = start_test_server_with_daemon_version(dir.path(), "0.51.0").await;
+
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_shux"))
+        .args([
+            "--format",
+            "json",
+            "--socket",
+            socket_path.to_str().unwrap(),
+            "version",
+        ])
+        .output()
+        .await
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(parsed["cli"]["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(parsed["daemon"]["version"], "0.51.0");
+    assert_eq!(parsed["mismatch"], true);
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn test_cli_version_matching_daemon_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let cli = env!("CARGO_PKG_VERSION");
+    let (socket_path, cancel) = start_test_server_with_daemon_version(dir.path(), cli).await;
+
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_shux"))
+        .args([
+            "--format",
+            "json",
+            "--socket",
+            socket_path.to_str().unwrap(),
+            "version",
+        ])
+        .output()
+        .await
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(parsed["cli"]["version"], cli);
+    assert_eq!(parsed["daemon"]["version"], cli);
+    assert_eq!(parsed["mismatch"], false);
 
     cancel.cancel();
 }
